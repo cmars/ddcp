@@ -13,5 +13,6 @@ flume = "0.11.0"
 rusqlite = {version = "0.29.0", features = ["load_extension"]}
 thiserror = "1.0.48"
 tokio = "1.32.0"
+tokio-rusqlite = "0.4.0"
 veilid-core = "0.2.1"
 xdg = "2.5.2"

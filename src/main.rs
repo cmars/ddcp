@@ -1,7 +1,7 @@
 use std::{io, path::PathBuf, sync::Arc};
 
 use flume::{unbounded, Receiver, Sender};
-use rusqlite::{Connection, OptionalExtension};
+use tokio_rusqlite::Connection;
 use veilid_core::{VeilidAPIError, VeilidUpdate};
 
 mod config;
@@ -9,7 +9,7 @@ mod config;
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("db error: {0}")]
-    DB(#[from] rusqlite::Error),
+    DB(#[from] tokio_rusqlite::Error),
     #[error("io error: {0}")]
     IO(#[from] io::Error),
     #[error("veilid api error: {0}")]
@@ -26,14 +26,17 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let conn = Connection::open(":memory:")?;
+    let conn = Connection::open_in_memory().await?;
     let ext_path = ext_path()?;
-    unsafe {
-        conn.load_extension_enable()?;
-        let r = conn.load_extension(ext_path.as_str(), Some("sqlite3_crsqlite_init"))?;
-        conn.load_extension_disable()?;
-        r
-    };
+    conn.call(move |c| {
+        unsafe {
+            c.load_extension_enable()?;
+            let r = c.load_extension(ext_path.as_str(), Some("sqlite3_crsqlite_init"))?;
+            c.load_extension_disable()?;
+            r
+        };
+        Ok(())
+    }).await?;
 
     let xdg_dirs = xdg::BaseDirectories::with_prefix("velouria").map_err(other_err)?;
     let state_dir = xdg_dirs
@@ -84,7 +87,10 @@ async fn run() -> Result<()> {
 
     // magic gonna happen here
 
-    conn.execute("SELECT crsql_finalize()", []).optional()?;
+    conn.call(|c| {
+        c.query_row("SELECT crsql_finalize()", [], |_row| ())?;
+        Ok(())
+    }).await?;
     Ok(())
 }
 
