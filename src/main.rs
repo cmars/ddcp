@@ -88,7 +88,7 @@ async fn run() -> Result<()> {
     // magic gonna happen here
 
     conn.call(|c| {
-        c.query_row("SELECT crsql_finalize()", [], |_row| ())?;
+        c.query_row("SELECT crsql_finalize()", [], |_row| Ok(()))?;
         Ok(())
     }).await?;
     Ok(())
