@@ -1,6 +1,6 @@
 use veilid_core::{ConfigCallbackReturn, FourCC, TypedKeyGroup, TypedSecretGroup, VeilidAPIError};
 
-pub fn config_callback(state_dir: String, key: String) -> ConfigCallbackReturn {
+pub fn callback(state_dir: String, key: String) -> ConfigCallbackReturn {
     match key.as_str() {
         "program_name" => Ok(Box::new(String::from("vldpipe"))),
         "namespace" => Ok(Box::<String>::default()),
