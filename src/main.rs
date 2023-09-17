@@ -4,14 +4,14 @@ use clap::Parser;
 use flume::{unbounded, Receiver, Sender};
 use tokio_rusqlite::Connection;
 use veilid_core::{
-    DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, KeyPair, RoutingContext, Sequencing, TypedKey,
-    VeilidAPI, VeilidAPIError, VeilidAPIResult, VeilidUpdate,
+    CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair, RoutingContext,
+    Sequencing, TypedKey, VeilidAPI, VeilidAPIError, VeilidAPIResult, VeilidUpdate,
 };
 
 mod cli;
 mod veilid_config;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, RemoteArgs, RemoteCommands};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -37,12 +37,23 @@ async fn run() -> Result<()> {
 
     let mut app = Velouria::new(&cli).await?;
 
-    app.wait_for_network().await?;
+    if cli.needs_network() {
+        app.wait_for_network().await?;
+    }
 
     // magic gonna happen here
     let result = match cli.commands {
         Commands::Init => app.init().await,
         Commands::Push => app.push().await,
+        Commands::Remote(RemoteArgs {
+            commands: RemoteCommands::Add { name, addr },
+        }) => app.remote_add(name, addr).await,
+        Commands::Remote(RemoteArgs {
+            commands: RemoteCommands::Remove { name },
+        }) => app.remote_remove(name).await,
+        Commands::Remote(RemoteArgs {
+            commands: RemoteCommands::List,
+        }) => app.remote_list().await,
         _ => Err(Error::Other("unsupported command".to_string())),
     };
 
@@ -57,7 +68,7 @@ pub struct Velouria {
     routing_context: RoutingContext,
 }
 
-const LOCAL_PEER_NAME: &'static str = "__local";
+const LOCAL_KEYPAIR_NAME: &'static str = "__local";
 
 impl Velouria {
     pub async fn new(cli: &Cli) -> Result<Velouria> {
@@ -140,14 +151,14 @@ impl Velouria {
 
     pub async fn init(&mut self) -> Result<()> {
         // Load or create DHT key
-        let local_dht = self.dht_key(LOCAL_PEER_NAME).await?;
+        let local_dht = self.dht_key(LOCAL_KEYPAIR_NAME).await?;
         println!("{}", local_dht.key().to_string());
         Ok(())
     }
 
     pub async fn push(&mut self) -> Result<()> {
         // Load or create DHT key
-        let local_dht = self.dht_key(LOCAL_PEER_NAME).await?;
+        let local_dht = self.dht_key(LOCAL_KEYPAIR_NAME).await?;
         println!("{}", local_dht.key().to_string());
 
         let key = local_dht.key().to_owned();
@@ -172,7 +183,7 @@ impl Velouria {
     }
 
     async fn dht_key(&self, name: &str) -> Result<DHTRecordDescriptor> {
-        let dht = match load_dht_key(&self.api, name).await? {
+        let dht = match load_dht_keypair(&self.api, name).await? {
             Some((key, owner)) => {
                 self.routing_context
                     .open_dht_record(key, Some(owner))
@@ -183,7 +194,7 @@ impl Velouria {
                     .routing_context
                     .create_dht_record(DHTSchema::DFLT(DHTSchemaDFLT { o_cnt: 2 }), None)
                     .await?;
-                store_dht_key(
+                store_dht_keypair(
                     &self.api,
                     name,
                     new_dht.key(),
@@ -218,10 +229,37 @@ impl Velouria {
 
         Ok(())
     }
+
+    async fn remote_add(&self, name: String, addr: String) -> Result<()> {
+        let key = CryptoTyped::from_str(addr.as_str())?;
+        store_dht_key(&self.api, &name, &key).await?;
+        Ok(())
+    }
+
+    async fn remote_remove(&self, name: String) -> Result<()> {
+        let db = &self.api.table_store()?.open("remote", 1).await?;
+        db.delete(0, name.as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn remote_list(&self) -> std::result::Result<(), Error> {
+        let db = &self.api.table_store()?.open("remote", 1).await?;
+        let keys = db.get_keys(0).await?;
+        for key in keys.iter() {
+            let name = std::str::from_utf8(key.as_slice()).expect("valid utf-8");
+            if let Some(remote_key) = load_dht_key(&self.api, name).await? {
+                println!("{} {}", name, remote_key.to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
-async fn load_dht_key(api: &VeilidAPI, name: &str) -> VeilidAPIResult<Option<(TypedKey, KeyPair)>> {
-    let db = api.table_store()?.open("velouria", 2).await?;
+async fn load_dht_keypair(
+    api: &VeilidAPI,
+    name: &str,
+) -> VeilidAPIResult<Option<(TypedKey, KeyPair)>> {
+    let db = api.table_store()?.open("local", 2).await?;
     let key = db.load_json::<TypedKey>(0, name.as_bytes()).await?;
     let owner = db.load_json::<KeyPair>(1, name.as_bytes()).await?;
     Ok(match (key, owner) {
@@ -230,15 +268,26 @@ async fn load_dht_key(api: &VeilidAPI, name: &str) -> VeilidAPIResult<Option<(Ty
     })
 }
 
-async fn store_dht_key(
+async fn load_dht_key(api: &VeilidAPI, name: &str) -> VeilidAPIResult<Option<TypedKey>> {
+    let db = api.table_store()?.open("remote", 1).await?;
+    let key = db.load_json::<TypedKey>(0, name.as_bytes()).await?;
+    Ok(key)
+}
+
+async fn store_dht_keypair(
     api: &VeilidAPI,
     name: &str,
     key: &TypedKey,
     owner: KeyPair,
 ) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open("velouria", 2).await?;
+    let db = api.table_store()?.open("local", 2).await?;
     db.store_json(0, name.as_bytes(), key).await?;
     db.store_json(1, name.as_bytes(), &owner).await
+}
+
+async fn store_dht_key(api: &VeilidAPI, name: &str, key: &TypedKey) -> VeilidAPIResult<()> {
+    let db = api.table_store()?.open("remote", 1).await?;
+    db.store_json(0, name.as_bytes(), key).await
 }
 
 fn other_err<T: ToString>(e: T) -> Error {

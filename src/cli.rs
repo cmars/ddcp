@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, command, Subcommand, Args};
-
+use clap::{command, Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "velouria")]
@@ -18,7 +17,7 @@ pub struct Cli {
 pub enum Commands {
     Init,
     Push,
-    Fetch{
+    Fetch {
         #[arg(required = false)]
         name: String,
     },
@@ -29,31 +28,38 @@ pub enum Commands {
 }
 
 #[derive(Args, Debug)]
-pub struct RemoteArgs{
+pub struct RemoteArgs {
     #[command(subcommand)]
     pub commands: RemoteCommands,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum RemoteCommands {
-    Add{
+    Add {
         #[arg(required = true)]
         name: String,
         #[arg(required = true)]
         addr: String,
     },
-    Remove{
+    Remove {
         #[arg(required = true)]
         name: String,
     },
     List,
-    Status{
+    Status {
         #[arg(required = true)]
         name: String,
     },
 }
 
 impl Cli {
+    pub fn needs_network(&self) -> bool {
+        match self.commands {
+            Commands::Remote(_) => false,
+            _ => true,
+        }
+    }
+
     pub fn path(&self, name: &str) -> String {
         must_path_as_string(PathBuf::from(self.app_dir()).join(name))
     }
@@ -71,5 +77,8 @@ impl Cli {
 }
 
 fn must_path_as_string(p: PathBuf) -> String {
-    p.as_os_str().to_os_string().into_string().expect("string-able path")
+    p.as_os_str()
+        .to_os_string()
+        .into_string()
+        .expect("string-able path")
 }
