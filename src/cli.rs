@@ -24,7 +24,7 @@ pub enum Commands {
     //Merge{ ... },
     //Pull{ ... },
     Remote(RemoteArgs),
-    //Serve{ ... },
+    Serve,
 }
 
 #[derive(Args, Debug)]

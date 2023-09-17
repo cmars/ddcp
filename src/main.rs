@@ -1,7 +1,8 @@
-use std::{io, path::PathBuf, sync::Arc};
+use std::{f32::consts::E, io, path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use flume::{unbounded, Receiver, Sender};
+use tokio::task::JoinHandle;
 use tokio_rusqlite::Connection;
 use veilid_core::{
     CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair, RoutingContext,
@@ -9,9 +10,11 @@ use veilid_core::{
 };
 
 mod cli;
+mod proto;
 mod veilid_config;
 
 use cli::{Cli, Commands, RemoteArgs, RemoteCommands};
+use proto::{Request, Response};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -21,6 +24,8 @@ pub enum Error {
     IO(#[from] io::Error),
     #[error("veilid api error: {0}")]
     VeilidAPI(#[from] VeilidAPIError),
+    #[error("prorotcol error: {0}")]
+    Protocol(#[from] proto::Error),
     #[error("other: {0}")]
     Other(String),
 }
@@ -41,7 +46,6 @@ async fn run() -> Result<()> {
         app.wait_for_network().await?;
     }
 
-    // magic gonna happen here
     let result = match cli.commands {
         Commands::Init => app.init().await,
         Commands::Push => app.push().await,
@@ -54,6 +58,7 @@ async fn run() -> Result<()> {
         Commands::Remote(RemoteArgs {
             commands: RemoteCommands::List,
         }) => app.remote_list().await,
+        Commands::Serve => app.serve().await,
         _ => Err(Error::Other("unsupported command".to_string())),
     };
 
@@ -163,17 +168,9 @@ impl Velouria {
 
         let key = local_dht.key().to_owned();
 
+        let (site_id, db_version) = status(&self.conn).await?;
+
         // Push current db state
-        let (site_id, db_version) = self.conn.call(|c| {
-            c.query_row("
-            select crsql_site_id(), (select max(db_version) from crsql_changes where site_id is null);
-            ", [], |row| {
-                Ok((
-                    row.get::<usize, Vec<u8>>(0)?,
-                    row.get::<usize, i64>(1)?,
-                ))
-            })
-        }).await?;
         self.routing_context.set_dht_value(key, 0, site_id).await?;
         self.routing_context
             .set_dht_value(key, 1, db_version.to_be_bytes().to_vec())
@@ -253,6 +250,129 @@ impl Velouria {
         }
         Ok(())
     }
+
+    async fn serve(&self) -> Result<()> {
+        let _ = self.local_tracker();
+        loop {
+            match self.updates.recv_async().await {
+                Ok(VeilidUpdate::AppCall(app_call)) => {
+                    let request = proto::decode_request_message(app_call.message())?;
+                    match request {
+                        Request::Status => {
+                            // TODO: spawn responder to unblock event loop
+                            let (site_id, db_version) = status(&self.conn).await?;
+                            let resp = proto::encode_response_message(Response::Status {
+                                site_id,
+                                db_version,
+                            })?;
+                            self.api.app_call_reply(app_call.id(), resp).await?;
+                        }
+                        Request::Changes { since_db_version } => {
+                            let changes = changes(&self.conn, since_db_version)?;
+                            let resp = proto::encode_response_message(Response::Changes(changes))?;
+                            self.api.app_call_reply(app_call.id(), resp)?;
+                        }
+                    }
+                }
+                Ok(VeilidUpdate::Shutdown) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(other_err(e)),
+            }
+        }
+    }
+
+    async fn local_tracker(&self) -> Result<JoinHandle<Result<()>>> {
+        let conn = self.conn.clone();
+        let routing_context = self.routing_context.clone();
+        let local_dht = self.dht_key(LOCAL_KEYPAIR_NAME).await?;
+        let key = local_dht.key().to_owned();
+
+        let mut timer = tokio::time::interval(Duration::from_secs(60));
+        let h = tokio::spawn(async move {
+            let mut prev_db_version = -1;
+            loop {
+                // TODO: select! for shutdown signal
+                timer.tick().await;
+                let (site_id, db_version) = status(&conn).await?;
+                if db_version <= prev_db_version {
+                    continue;
+                }
+
+                routing_context.set_dht_value(key, 0, site_id).await?;
+                routing_context
+                    .set_dht_value(key, 1, db_version.to_be_bytes().to_vec())
+                    .await?;
+                prev_db_version = db_version;
+            }
+        });
+        Ok(h)
+    }
+}
+
+async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
+    let (site_id, db_version) = conn.call(|c| {
+            c.query_row("
+            select crsql_site_id(), (select max(db_version) from crsql_changes where site_id is null);
+            ", [], |row| {
+                Ok((
+                    row.get::<usize, Vec<u8>>(0)?,
+                    row.get::<usize, i64>(1)?,
+                ))
+            })
+        }).await?;
+    Ok((site_id, db_version))
+}
+
+async fn changes(conn: &Connection, since_db_version: i64) -> Result<Vec<proto::Change>> {
+    let changes = conn
+        .call(move |c| {
+            let mut stmt = c.prepare(
+                "
+            select
+                table,
+                pk,
+                cid,
+                val,
+                col_version,
+                db_version,
+                site_id,
+                cl,
+                seq
+            from crsql_changes
+            where db_version > ?
+            and site_id is null
+            ",
+            )?;
+            let changes_iter = stmt.query_map([since_db_version], |row| {
+                Ok(proto::Change {
+                    table: row.get::<usize, String>(0)?,
+                    pk: row.get::<usize, String>(1)?,
+                    cid: row.get::<usize, String>(2)?,
+                    val: row.get::<usize, Vec<u8>>(3)?,
+                    col_version: row.get::<usize, i64>(4)?,
+                    db_version: row.get::<usize, i64>(5)?,
+                    site_id: vec![],
+                    cl: row.get::<usize, i64>(7)?,
+                    seq: row.get::<usize, i64>(8)?,
+                })
+            })?;
+            changes_iter.fold(Ok(vec![]), |acc, x| {
+                match acc {
+                    Ok(mut changes) => {
+                        match x {
+                            Ok(change) => {
+                                changes.push(change);
+                                Ok(changes)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+        })
+        .await?;
+    Ok(changes)
 }
 
 async fn load_dht_keypair(
