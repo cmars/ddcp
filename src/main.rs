@@ -1,12 +1,12 @@
-use std::{f32::consts::E, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use flume::{unbounded, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_rusqlite::Connection;
 use veilid_core::{
-    CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair, RoutingContext,
-    Sequencing, TypedKey, VeilidAPI, VeilidAPIError, VeilidAPIResult, VeilidUpdate,
+    CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
+    RoutingContext, Sequencing, TypedKey, VeilidAPI, VeilidAPIError, VeilidAPIResult, VeilidUpdate,
 };
 
 mod cli;
@@ -26,6 +26,8 @@ pub enum Error {
     VeilidAPI(#[from] VeilidAPIError),
     #[error("prorotcol error: {0}")]
     Protocol(#[from] proto::Error),
+    #[error("utf-8 encoding error: {0}")]
+    Utf8(#[from] std::str::Utf8Error),
     #[error("other: {0}")]
     Other(String),
 }
@@ -239,20 +241,30 @@ impl Velouria {
         Ok(())
     }
 
-    async fn remote_list(&self) -> std::result::Result<(), Error> {
-        let db = &self.api.table_store()?.open("remote", 1).await?;
-        let keys = db.get_keys(0).await?;
-        for key in keys.iter() {
-            let name = std::str::from_utf8(key.as_slice()).expect("valid utf-8");
-            if let Some(remote_key) = load_dht_key(&self.api, name).await? {
-                println!("{} {}", name, remote_key.to_string());
-            }
+    async fn remote_list(&self) -> Result<()> {
+        let remotes = self.remotes().await?;
+        for (name, key) in remotes.iter() {
+            println!("{} {}", name, key.to_string());
         }
         Ok(())
     }
 
+    async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
+        let db = &self.api.table_store()?.open("remote", 1).await?;
+        let keys = db.get_keys(0).await?;
+        let mut result = vec![];
+        for db_key in keys.iter() {
+            let name = std::str::from_utf8(db_key.as_slice())?.to_owned();
+            if let Some(remote_key) = load_dht_key(&self.api, name.as_str()).await? {
+                result.push((name, remote_key));
+            }
+        }
+        Ok(result)
+    }
+
     async fn serve(&self) -> Result<()> {
         let _ = self.local_tracker();
+        //let _ = self.remote_tracker();
         loop {
             match self.updates.recv_async().await {
                 Ok(VeilidUpdate::AppCall(app_call)) => {
@@ -268,9 +280,9 @@ impl Velouria {
                             self.api.app_call_reply(app_call.id(), resp).await?;
                         }
                         Request::Changes { since_db_version } => {
-                            let changes = changes(&self.conn, since_db_version)?;
+                            let changes = changes(&self.conn, since_db_version).await?;
                             let resp = proto::encode_response_message(Response::Changes(changes))?;
-                            self.api.app_call_reply(app_call.id(), resp)?;
+                            self.api.app_call_reply(app_call.id(), resp).await?;
                         }
                     }
                 }
@@ -281,6 +293,7 @@ impl Velouria {
         }
     }
 
+    /// Poll local db for changes in latest db version, update DHT.
     async fn local_tracker(&self) -> Result<JoinHandle<Result<()>>> {
         let conn = self.conn.clone();
         let routing_context = self.routing_context.clone();
@@ -306,6 +319,10 @@ impl Velouria {
             }
         });
         Ok(h)
+    }
+
+    async fn remote_tracker(&self) -> Result<JoinHandle<Result<()>>> {
+        todo!();
     }
 }
 
@@ -356,19 +373,15 @@ async fn changes(conn: &Connection, since_db_version: i64) -> Result<Vec<proto::
                     seq: row.get::<usize, i64>(8)?,
                 })
             })?;
-            changes_iter.fold(Ok(vec![]), |acc, x| {
-                match acc {
-                    Ok(mut changes) => {
-                        match x {
-                            Ok(change) => {
-                                changes.push(change);
-                                Ok(changes)
-                            }
-                            Err(e) => Err(e),
-                        }
+            changes_iter.fold(Ok(vec![]), |acc, x| match acc {
+                Ok(mut changes) => match x {
+                    Ok(change) => {
+                        changes.push(change);
+                        Ok(changes)
                     }
                     Err(e) => Err(e),
-                }
+                },
+                Err(e) => Err(e),
             })
         })
         .await?;

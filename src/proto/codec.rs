@@ -3,7 +3,7 @@ use capnp::{
     serialize,
 };
 
-use super::{velouria_capnp::response, velouria_capnp::request};
+use super::{velouria_capnp::request, velouria_capnp::response};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn response_changes() {
         let changes = vec![
-            Change{
+            Change {
                 table: "some_table".to_owned(),
                 pk: "some_pk".to_owned(),
                 cid: "el_cid".to_owned(),
@@ -210,7 +210,7 @@ mod tests {
                 cl: 99,
                 seq: 999,
             },
-            Change{
+            Change {
                 table: "some_other_table".to_owned(),
                 pk: "some_other_pk".to_owned(),
                 cid: "a_cid".to_owned(),
