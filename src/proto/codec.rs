@@ -24,8 +24,14 @@ pub enum Request {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
-    Status { site_id: Vec<u8>, db_version: i64 },
-    Changes(Vec<Change>),
+    Status {
+        site_id: Vec<u8>,
+        db_version: i64,
+    },
+    Changes {
+        site_id: Vec<u8>,
+        changes: Vec<Change>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -36,7 +42,6 @@ pub struct Change {
     pub val: Vec<u8>,
     pub col_version: i64,
     pub db_version: i64,
-    pub site_id: Vec<u8>,
     pub cl: i64,
     pub seq: i64,
 }
@@ -90,17 +95,19 @@ pub fn decode_response_message(msg_bytes: &[u8]) -> Result<Response> {
 
 pub fn encode_response(response: Response, builder: &mut response::Builder) -> Result<()> {
     Ok(match response {
-        Response::Changes(changes) => {
-            let mut build_changes = builder.reborrow().init_changes(changes.len() as u32);
+        Response::Changes { site_id, changes } => {
+            let mut build_changes = builder.reborrow().init_changes();
+            build_changes.set_site_id(&site_id);
+            let mut build_changes_changes =
+                build_changes.reborrow().init_changes(changes.len() as u32);
             for i in 0..changes.len() {
-                let mut build_change = build_changes.reborrow().get(i as u32);
+                let mut build_change = build_changes_changes.reborrow().get(i as u32);
                 build_change.set_table(changes[i].table.as_str().into());
                 build_change.set_pk(changes[i].pk.as_str().into());
                 build_change.set_cid(changes[i].cid.as_str().into());
                 build_change.set_val(changes[i].val.as_slice());
                 build_change.set_col_version(changes[i].col_version);
                 build_change.set_db_version(changes[i].db_version);
-                build_change.set_site_id(changes[i].site_id.as_slice());
                 build_change.set_cl(changes[i].cl);
                 build_change.set_seq(changes[i].seq);
             }
@@ -125,9 +132,10 @@ pub fn decode_response(reader: &response::Reader) -> Result<Response> {
         },
         response::Which::Status(Err(e)) => return Err(e.into()),
         response::Which::Changes(Ok(changes)) => {
+            let changes_changes = changes.get_changes()?;
             let mut resp_changes = vec![];
-            for i in 0..changes.len() {
-                let change = changes.get(i);
+            for i in 0..changes_changes.len() {
+                let change = changes_changes.get(i);
                 resp_changes.push(Change {
                     table: change.get_table()?.to_string()?,
                     pk: change.get_pk()?.to_string()?,
@@ -135,12 +143,14 @@ pub fn decode_response(reader: &response::Reader) -> Result<Response> {
                     val: change.get_val()?.to_vec(),
                     col_version: change.get_col_version(),
                     db_version: change.get_db_version(),
-                    site_id: change.get_site_id()?.to_vec(),
                     cl: change.get_cl(),
                     seq: change.get_seq(),
                 });
             }
-            Response::Changes(resp_changes)
+            Response::Changes {
+                site_id: changes.get_site_id()?.to_owned(),
+                changes: resp_changes,
+            }
         }
         response::Which::Changes(Err(e)) => return Err(e.into()),
     })
@@ -191,9 +201,19 @@ mod tests {
 
     #[test]
     fn response_changes_empty() {
-        let msg_bytes = encode_response_message(Response::Changes(vec![])).expect("ok");
+        let msg_bytes = encode_response_message(Response::Changes {
+            site_id: "foo".as_bytes().to_vec(),
+            changes: vec![],
+        })
+        .expect("ok");
         let decoded = decode_response_message(&msg_bytes).expect("ok");
-        assert_eq!(Response::Changes(vec![]), decoded);
+        assert_eq!(
+            Response::Changes {
+                site_id: "foo".as_bytes().to_vec(),
+                changes: vec![]
+            },
+            decoded
+        );
     }
 
     #[test]
@@ -206,7 +226,6 @@ mod tests {
                 val: vec![0xa5u8, 8],
                 col_version: 23,
                 db_version: 42,
-                site_id: "foo".as_bytes().to_vec(),
                 cl: 99,
                 seq: 999,
             },
@@ -217,13 +236,22 @@ mod tests {
                 val: vec![0x5au8, 8],
                 col_version: 32,
                 db_version: 24,
-                site_id: "bar".as_bytes().to_vec(),
                 cl: 111,
                 seq: 1111,
             },
         ];
-        let msg_bytes = encode_response_message(Response::Changes(changes.clone())).expect("ok");
+        let msg_bytes = encode_response_message(Response::Changes {
+            site_id: "foo".as_bytes().to_vec(),
+            changes: changes.clone(),
+        })
+        .expect("ok");
         let decoded = decode_response_message(&msg_bytes).expect("ok");
-        assert_eq!(Response::Changes(changes), decoded);
+        assert_eq!(
+            Response::Changes {
+                site_id: "foo".as_bytes().to_vec(),
+                changes,
+            },
+            decoded
+        );
     }
 }

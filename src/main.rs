@@ -1,12 +1,13 @@
-use std::{io, path::PathBuf, sync::Arc, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, time::Duration, fs};
 
 use clap::Parser;
 use flume::{unbounded, Receiver, Sender};
-use tokio::task::JoinHandle;
+use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    RoutingContext, Sequencing, TypedKey, VeilidAPI, VeilidAPIError, VeilidAPIResult, VeilidUpdate,
+    RoutingContext, Sequencing, Target, TypedKey, ValueSubkey, VeilidAPI, VeilidAPIError,
+    VeilidAPIResult, VeilidUpdate,
 };
 
 mod cli;
@@ -41,6 +42,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = cli::Cli::parse();
+    fs::DirBuilder::new().recursive(true).create(cli.app_dir())?;
 
     let mut app = Velouria::new(&cli).await?;
 
@@ -61,6 +63,8 @@ async fn run() -> Result<()> {
             commands: RemoteCommands::List,
         }) => app.remote_list().await,
         Commands::Serve => app.serve().await,
+        Commands::Cleanup => Ok(()),
+        Commands::Fetch{ name } => app.fetch(name.as_str()).await,
         _ => Err(Error::Other("unsupported command".to_string())),
     };
 
@@ -73,9 +77,14 @@ pub struct Velouria {
     api: VeilidAPI,
     updates: Receiver<VeilidUpdate>,
     routing_context: RoutingContext,
+    dht_keypair: Option<DHTRecordDescriptor>,
 }
 
 const LOCAL_KEYPAIR_NAME: &'static str = "__local";
+
+const SUBKEY_SITE_ID: ValueSubkey = 0;
+const SUBKEY_DB_VERSION: ValueSubkey = 1;
+const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
 
 impl Velouria {
     pub async fn new(cli: &Cli) -> Result<Velouria> {
@@ -90,6 +99,7 @@ impl Velouria {
             api,
             updates,
             routing_context,
+            dht_keypair: None,
         })
     }
 
@@ -157,31 +167,109 @@ impl Velouria {
     }
 
     pub async fn init(&mut self) -> Result<()> {
+        // Initialize tracker table
+        self.init_db().await?;
         // Load or create DHT key
-        let local_dht = self.dht_key(LOCAL_KEYPAIR_NAME).await?;
+        let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         println!("{}", local_dht.key().to_string());
+        self.dht_keypair = Some(local_dht);
+        Ok(())
+    }
+
+    async fn init_db(&self) -> Result<()> {
+        self.conn
+            .call(|conn| {
+                conn.execute(
+                    "
+            create table if not exists vlr_remote_changes (
+                \"table\" text not null,
+                pk text not null,
+                cid text not null,
+                val any,
+                col_version integer not null,
+                db_version integer not null,
+                site_id blob not null,
+                cl integer not null,
+                seq integer not null
+            );
+            ",
+                    [],
+                )
+            })
+            .await?;
         Ok(())
     }
 
     pub async fn push(&mut self) -> Result<()> {
         // Load or create DHT key
-        let local_dht = self.dht_key(LOCAL_KEYPAIR_NAME).await?;
+        let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         println!("{}", local_dht.key().to_string());
+        self.dht_keypair = Some(local_dht.clone());
 
         let key = local_dht.key().to_owned();
 
         let (site_id, db_version) = status(&self.conn).await?;
 
         // Push current db state
-        self.routing_context.set_dht_value(key, 0, site_id).await?;
         self.routing_context
-            .set_dht_value(key, 1, db_version.to_be_bytes().to_vec())
+            .set_dht_value(key, SUBKEY_SITE_ID, site_id)
+            .await?;
+        self.routing_context
+            .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
             .await?;
 
         Ok(())
     }
 
-    async fn dht_key(&self, name: &str) -> Result<DHTRecordDescriptor> {
+    pub async fn fetch(&mut self, name: &str) -> Result<()> {
+        let dht = match load_dht_key(&self.api, name).await? {
+            Some(key) => self.routing_context.open_dht_record(key, None).await?,
+            None => return Err(other_err(format!("remote {} not found", name))),
+        };
+        let maybe_site_id = self
+            .routing_context
+            .get_dht_value(dht.key().to_owned(), SUBKEY_SITE_ID, true)
+            .await?;
+        let maybe_db_version = self
+            .routing_context
+            .get_dht_value(dht.key().to_owned(), SUBKEY_DB_VERSION, true)
+            .await?;
+        let maybe_route_blob = self
+            .routing_context
+            .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
+            .await?;
+        let (site_id, db_version, route_blob) =
+            match (maybe_site_id, maybe_db_version, maybe_route_blob) {
+                (Some(sid), Some(dbv), Some(rt)) => {
+                    let dbv_arr: [u8; 8] = dbv.data().try_into().map_err(other_err)?;
+                    (
+                        sid.data().to_owned(),
+                        i64::from_be_bytes(dbv_arr),
+                        rt.data().to_owned(),
+                    )
+                }
+                _ => return Err(other_err(format!("remote {} not available", name))),
+            };
+
+        let route_id = self.api.import_remote_private_route(route_blob)?;
+        let msg_bytes = self
+            .routing_context
+            .app_call(
+                Target::PrivateRoute(route_id),
+                proto::encode_request_message(Request::Changes {
+                    since_db_version: db_version,
+                })?,
+            )
+            .await?;
+        let resp = proto::decode_response_message(msg_bytes.as_slice())?;
+
+        // TODO: load into vlr_remote_changes
+        println!("got resp: {:?}", resp);
+
+        Ok(())
+    }
+
+    async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match load_dht_keypair(&self.api, name).await? {
             Some((key, owner)) => {
                 self.routing_context
@@ -191,7 +279,7 @@ impl Velouria {
             None => {
                 let new_dht = self
                     .routing_context
-                    .create_dht_record(DHTSchema::DFLT(DHTSchemaDFLT { o_cnt: 2 }), None)
+                    .create_dht_record(DHTSchema::DFLT(DHTSchemaDFLT { o_cnt: 3 }), None)
                     .await?;
                 store_dht_keypair(
                     &self.api,
@@ -210,6 +298,17 @@ impl Velouria {
     }
 
     pub async fn cleanup(self) -> Result<()> {
+        // Attempt to close DHT record
+        if let Some(local_dht) = self.dht_keypair {
+            if let Err(e) = self
+                .routing_context
+                .close_dht_record(local_dht.key().to_owned())
+                .await
+            {
+                eprintln!("failed to close DHT record: {:?}", e);
+            }
+        }
+
         // Shut down Veilid node
         eprintln!("detach");
         self.api.detach().await?;
@@ -262,67 +361,105 @@ impl Velouria {
         Ok(result)
     }
 
-    async fn serve(&self) -> Result<()> {
-        let _ = self.local_tracker();
-        //let _ = self.remote_tracker();
+    async fn serve(&mut self) -> Result<()> {
+        // Create a private route and publish it
+        let (route_id, route_blob) = self.api.new_private_route().await?;
+        let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
+        self.dht_keypair = Some(local_dht.clone());
+        self.routing_context
+            .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
+            .await?;
+
+        let (stop_sender, stop_receiver) = oneshot::channel::<()>();
+        let tracker_handle = self.local_tracker(stop_receiver, local_dht.clone()).await?;
+
+        // Handle requests from peers
         loop {
-            match self.updates.recv_async().await {
-                Ok(VeilidUpdate::AppCall(app_call)) => {
-                    let request = proto::decode_request_message(app_call.message())?;
-                    match request {
-                        Request::Status => {
-                            // TODO: spawn responder to unblock event loop
-                            let (site_id, db_version) = status(&self.conn).await?;
-                            let resp = proto::encode_response_message(Response::Status {
-                                site_id,
-                                db_version,
-                            })?;
-                            self.api.app_call_reply(app_call.id(), resp).await?;
+            select! {
+                res = self.updates.recv_async() => {
+                    match res {
+                        Ok(VeilidUpdate::AppCall(app_call)) => {
+                            let request = match proto::decode_request_message(app_call.message()) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    eprintln!("invalid request: {:?}", e);
+                                    continue
+                                }
+                            };
+                            match request {
+                                Request::Status => {
+                                    // TODO: spawn responder to unblock event loop
+                                    let (site_id, db_version) = status(&self.conn).await?;
+                                    let resp = proto::encode_response_message(Response::Status {
+                                        site_id,
+                                        db_version,
+                                    })?;
+                                    self.api.app_call_reply(app_call.id(), resp).await?;
+                                }
+                                Request::Changes { since_db_version } => {
+                                    let (site_id, changes) = changes(&self.conn, since_db_version).await?;
+                                    let resp = proto::encode_response_message(Response::Changes{
+                                        site_id,
+                                        changes,
+                                    })?;
+                                    self.api.app_call_reply(app_call.id(), resp).await?;
+                                }
+                            }
                         }
-                        Request::Changes { since_db_version } => {
-                            let changes = changes(&self.conn, since_db_version).await?;
-                            let resp = proto::encode_response_message(Response::Changes(changes))?;
-                            self.api.app_call_reply(app_call.id(), resp).await?;
-                        }
+                        Ok(VeilidUpdate::Shutdown) => return Ok(()),
+                        Ok(_) => {}
+                        Err(e) => return Err(other_err(e)),
                     }
                 }
-                Ok(VeilidUpdate::Shutdown) => return Ok(()),
-                Ok(_) => {}
-                Err(e) => return Err(other_err(e)),
+                _ = signal::ctrl_c() => {
+                    eprintln!("interrupt received");
+                    stop_sender.send(()).map_err(|e| other_err(format!("{:?}", e)))?;
+                    break
+                }
             }
         }
+        self.api.release_private_route(route_id)?;
+        tracker_handle.await.map_err(other_err)??;
+        Ok(())
     }
 
     /// Poll local db for changes in latest db version, update DHT.
-    async fn local_tracker(&self) -> Result<JoinHandle<Result<()>>> {
+    async fn local_tracker(
+        &self,
+        mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
+        local_dht: DHTRecordDescriptor,
+    ) -> Result<JoinHandle<Result<()>>> {
         let conn = self.conn.clone();
         let routing_context = self.routing_context.clone();
-        let local_dht = self.dht_key(LOCAL_KEYPAIR_NAME).await?;
         let key = local_dht.key().to_owned();
-
         let mut timer = tokio::time::interval(Duration::from_secs(60));
+
         let h = tokio::spawn(async move {
             let mut prev_db_version = -1;
             loop {
-                // TODO: select! for shutdown signal
-                timer.tick().await;
-                let (site_id, db_version) = status(&conn).await?;
-                if db_version <= prev_db_version {
-                    continue;
-                }
+                select! {
+                    _ = timer.tick() => {
+                        // TODO: select! for shutdown signal
+                        timer.tick().await;
+                        let (site_id, db_version) = status(&conn).await?;
+                        if db_version <= prev_db_version {
+                            continue;
+                        }
 
-                routing_context.set_dht_value(key, 0, site_id).await?;
-                routing_context
-                    .set_dht_value(key, 1, db_version.to_be_bytes().to_vec())
-                    .await?;
-                prev_db_version = db_version;
+                        routing_context.set_dht_value(key, SUBKEY_SITE_ID, site_id).await?;
+                        routing_context
+                            .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
+                            .await?;
+                        prev_db_version = db_version;
+                    }
+                    _ = &mut stop_receiver => {
+                        break;
+                    }
+                }
             }
+            Ok(())
         });
         Ok(h)
-    }
-
-    async fn remote_tracker(&self) -> Result<JoinHandle<Result<()>>> {
-        todo!();
     }
 }
 
@@ -340,7 +477,14 @@ async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
     Ok((site_id, db_version))
 }
 
-async fn changes(conn: &Connection, since_db_version: i64) -> Result<Vec<proto::Change>> {
+async fn changes(
+    conn: &Connection,
+    since_db_version: i64,
+) -> Result<(Vec<u8>, Vec<proto::Change>)> {
+    let (site_id, db_version) = status(conn).await?;
+    if since_db_version >= db_version {
+        return Ok((site_id, vec![]));
+    }
     let changes = conn
         .call(move |c| {
             let mut stmt = c.prepare(
@@ -352,7 +496,6 @@ async fn changes(conn: &Connection, since_db_version: i64) -> Result<Vec<proto::
                 val,
                 col_version,
                 db_version,
-                site_id,
                 cl,
                 seq
             from crsql_changes
@@ -368,7 +511,6 @@ async fn changes(conn: &Connection, since_db_version: i64) -> Result<Vec<proto::
                     val: row.get::<usize, Vec<u8>>(3)?,
                     col_version: row.get::<usize, i64>(4)?,
                     db_version: row.get::<usize, i64>(5)?,
-                    site_id: vec![],
                     cl: row.get::<usize, i64>(7)?,
                     seq: row.get::<usize, i64>(8)?,
                 })
@@ -385,7 +527,7 @@ async fn changes(conn: &Connection, since_db_version: i64) -> Result<Vec<proto::
             })
         })
         .await?;
-    Ok(changes)
+    Ok((site_id, changes))
 }
 
 async fn load_dht_keypair(

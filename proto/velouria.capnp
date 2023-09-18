@@ -14,8 +14,13 @@ struct ChangesParams {
 struct Response {
     union {
         status @0 :Status;
-        changes @1 :List(Change);
+        changes @1 :ChangesResult;
     }
+}
+
+struct ChangesResult {
+    siteId @0 :Data;
+    changes @1 :List(Change);
 }
 
 struct Status {

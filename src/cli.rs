@@ -25,6 +25,7 @@ pub enum Commands {
     //Pull{ ... },
     Remote(RemoteArgs),
     Serve,
+    Cleanup,
 }
 
 #[derive(Args, Debug)]
