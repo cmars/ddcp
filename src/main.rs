@@ -257,7 +257,7 @@ impl Velouria {
             .app_call(
                 Target::PrivateRoute(route_id),
                 proto::encode_request_message(Request::Changes {
-                    since_db_version: db_version,
+                    since_db_version: -1,
                 })?,
             )
             .await?;
@@ -372,6 +372,8 @@ impl Velouria {
 
         let (stop_sender, stop_receiver) = oneshot::channel::<()>();
         let tracker_handle = self.local_tracker(stop_receiver, local_dht.clone()).await?;
+
+        println!("{}", local_dht.key().to_string());
 
         // Handle requests from peers
         loop {
@@ -490,7 +492,7 @@ async fn changes(
             let mut stmt = c.prepare(
                 "
             select
-                table,
+                \"table\",
                 pk,
                 cid,
                 val,
