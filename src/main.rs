@@ -2,6 +2,7 @@ use std::{io, path::PathBuf, sync::Arc, time::Duration, fs};
 
 use clap::Parser;
 use flume::{unbounded, Receiver, Sender};
+use rusqlite::params;
 use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
 use veilid_core::{
@@ -263,9 +264,38 @@ impl Velouria {
             .await?;
         let resp = proto::decode_response_message(msg_bytes.as_slice())?;
 
-        // TODO: load into vlr_remote_changes
-        println!("got resp: {:?}", resp);
+        if let Response::Changes{ site_id, changes } = resp {
+            self.stage(site_id, changes).await?;
+        }
 
+        Ok(())
+    }
+
+    async fn stage(&mut self, site_id: Vec<u8>, changes: Vec<proto::Change>) -> Result<()> {
+        self.conn.call(move |conn| {
+            let tx = conn.transaction()?;
+            let mut stmt = tx.prepare("
+                insert into vlr_remote_changes (
+                    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            ")?;
+            for change in changes.iter() {
+                stmt.execute(params![
+                    &change.table,
+                    &change.pk,
+                    &change.cid,
+                    &change.val,
+                    &change.col_version,
+                    &change.db_version,
+                    &site_id,
+                    &change.cl,
+                    &change.seq,
+                ])?;
+            }
+            drop(stmt);
+            tx.commit()
+        }).await?;
         Ok(())
     }
 
@@ -508,13 +538,13 @@ async fn changes(
             let changes_iter = stmt.query_map([since_db_version], |row| {
                 Ok(proto::Change {
                     table: row.get::<usize, String>(0)?,
-                    pk: row.get::<usize, String>(1)?,
+                    pk: String::from_utf8(row.get::<usize, Vec<u8>>(1)?).map_err(|e| rusqlite::Error::Utf8Error(e.utf8_error()))?,
                     cid: row.get::<usize, String>(2)?,
-                    val: row.get::<usize, Vec<u8>>(3)?,
+                    val: row.get::<usize, String>(3)?.into_bytes(),
                     col_version: row.get::<usize, i64>(4)?,
                     db_version: row.get::<usize, i64>(5)?,
-                    cl: row.get::<usize, i64>(7)?,
-                    seq: row.get::<usize, i64>(8)?,
+                    cl: row.get::<usize, i64>(6)?,
+                    seq: row.get::<usize, i64>(7)?,
                 })
             })?;
             changes_iter.fold(Ok(vec![]), |acc, x| match acc {
