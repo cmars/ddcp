@@ -239,6 +239,8 @@ impl Velouria {
             .routing_context
             .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
             .await?;
+
+        // TODO: query local stage for site, compare with remote db_version, decide whether there's anything to fetch
         let (site_id, db_version, route_blob) =
             match (maybe_site_id, maybe_db_version, maybe_route_blob) {
                 (Some(sid), Some(dbv), Some(rt)) => {
@@ -298,6 +300,8 @@ impl Velouria {
         }).await?;
         Ok(())
     }
+
+    // TODO: async fn pull, it's an insert into crsql_changes select from vlr_remote_changes
 
     async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match load_dht_keypair(&self.api, name).await? {
