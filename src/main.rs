@@ -1,8 +1,8 @@
-use std::{io, path::PathBuf, sync::Arc, time::Duration, fs};
+use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use flume::{unbounded, Receiver, Sender};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
 use veilid_core::{
@@ -43,7 +43,9 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = cli::Cli::parse();
-    fs::DirBuilder::new().recursive(true).create(cli.app_dir())?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .create(cli.app_dir())?;
 
     let mut app = Velouria::new(&cli).await?;
 
@@ -65,7 +67,7 @@ async fn run() -> Result<()> {
         }) => app.remote_list().await,
         Commands::Serve => app.serve().await,
         Commands::Cleanup => Ok(()),
-        Commands::Fetch{ name } => app.fetch(name.as_str()).await,
+        Commands::Fetch { name } => app.fetch(name.as_str()).await,
         _ => Err(Error::Other("unsupported command".to_string())),
     };
 
@@ -182,18 +184,18 @@ impl Velouria {
             .call(|conn| {
                 conn.execute(
                     "
-            create table if not exists vlr_remote_changes (
-                \"table\" text not null,
-                pk text not null,
-                cid text not null,
-                val any,
-                col_version integer not null,
-                db_version integer not null,
-                site_id blob not null,
-                cl integer not null,
-                seq integer not null
-            );
-            ",
+                    create table if not exists vlr_remote_changes (
+                        \"table\" text not null,
+                        pk text not null,
+                        cid text not null,
+                        val any,
+                        col_version integer not null,
+                        db_version integer not null,
+                        site_id blob not null,
+                        cl integer not null,
+                        seq integer not null
+                    );
+                    ",
                     [],
                 )
             })
@@ -223,6 +225,54 @@ impl Velouria {
     }
 
     pub async fn fetch(&mut self, name: &str) -> Result<()> {
+        // Get latest status from DHT
+        let (site_id, db_version, route_blob) = self.remote_status(name).await?;
+
+        // Do we need to fetch newer versions?
+        let tracked_version = match self
+            .conn
+            .call(|conn| {
+                conn.query_row(
+                    "
+select max(db_version) from crsql_tracked_peers
+where site_id = ? and event = 0",
+                    [site_id],
+                    |row| row.get::<usize, i64>(0),
+                )
+                .optional()
+            })
+            .await?
+        {
+            Some(tracked_version) => {
+                if db_version <= tracked_version {
+                    eprintln!("remote {} is up to date", name);
+                    return Ok(());
+                }
+                tracked_version
+            }
+            None => -1,
+        };
+
+        let route_id = self.api.import_remote_private_route(route_blob)?;
+        let msg_bytes = self
+            .routing_context
+            .app_call(
+                Target::PrivateRoute(route_id),
+                proto::encode_request_message(Request::Changes {
+                    since_db_version: tracked_version,
+                })?,
+            )
+            .await?;
+        let resp = proto::decode_response_message(msg_bytes.as_slice())?;
+
+        if let Response::Changes { site_id, changes } = resp {
+            self.stage(site_id, changes).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
         let dht = match load_dht_key(&self.api, name).await? {
             Some(key) => self.routing_context.open_dht_record(key, None).await?,
             None => return Err(other_err(format!("remote {} not found", name))),
@@ -240,64 +290,58 @@ impl Velouria {
             .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
             .await?;
 
-        // TODO: query local stage for site, compare with remote db_version, decide whether there's anything to fetch
-        let (site_id, db_version, route_blob) =
-            match (maybe_site_id, maybe_db_version, maybe_route_blob) {
-                (Some(sid), Some(dbv), Some(rt)) => {
-                    let dbv_arr: [u8; 8] = dbv.data().try_into().map_err(other_err)?;
-                    (
-                        sid.data().to_owned(),
-                        i64::from_be_bytes(dbv_arr),
-                        rt.data().to_owned(),
-                    )
-                }
-                _ => return Err(other_err(format!("remote {} not available", name))),
-            };
-
-        let route_id = self.api.import_remote_private_route(route_blob)?;
-        let msg_bytes = self
-            .routing_context
-            .app_call(
-                Target::PrivateRoute(route_id),
-                proto::encode_request_message(Request::Changes {
-                    since_db_version: -1,
-                })?,
-            )
-            .await?;
-        let resp = proto::decode_response_message(msg_bytes.as_slice())?;
-
-        if let Response::Changes{ site_id, changes } = resp {
-            self.stage(site_id, changes).await?;
-        }
-
-        Ok(())
+        Ok(match (maybe_site_id, maybe_db_version, maybe_route_blob) {
+            (Some(sid), Some(dbv), Some(rt)) => {
+                let dbv_arr: [u8; 8] = dbv.data().try_into().map_err(other_err)?;
+                (
+                    sid.data().to_owned(),
+                    i64::from_be_bytes(dbv_arr),
+                    rt.data().to_owned(),
+                )
+            }
+            _ => return Err(other_err(format!("remote {} not available", name))),
+        })
     }
 
     async fn stage(&mut self, site_id: Vec<u8>, changes: Vec<proto::Change>) -> Result<()> {
-        self.conn.call(move |conn| {
-            let tx = conn.transaction()?;
-            let mut stmt = tx.prepare("
-                insert into vlr_remote_changes (
-                    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
-                )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?);
-            ")?;
-            for change in changes.iter() {
-                stmt.execute(params![
-                    &change.table,
-                    &change.pk,
-                    &change.cid,
-                    &change.val,
-                    &change.col_version,
-                    &change.db_version,
-                    &site_id,
-                    &change.cl,
-                    &change.seq,
-                ])?;
-            }
-            drop(stmt);
-            tx.commit()
-        }).await?;
+        self.conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let mut max_db_version = -1;
+                let mut stmt = tx.prepare(
+                    "
+insert into vlr_remote_changes (
+    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
+)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                )?;
+                for change in changes.iter() {
+                    if change.db_version > max_db_version {
+                        max_db_version = change.db_version;
+                    }
+                    stmt.execute(params![
+                        &change.table,
+                        &change.pk,
+                        &change.cid,
+                        &change.val,
+                        &change.col_version,
+                        &change.db_version,
+                        &site_id,
+                        &change.cl,
+                        &change.seq,
+                    ])?;
+                }
+                tx.execute(
+                    "
+insert into crsql_tracked_peers (site_id, version, event)
+values (?, ?, ?)
+on conflict do update set version = excluded.version",
+                    params![site_id, max_db_version, 0],
+                )?;
+                drop(stmt);
+                tx.commit()
+            })
+            .await?;
         Ok(())
     }
 
@@ -501,9 +545,10 @@ impl Velouria {
 
 async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
     let (site_id, db_version) = conn.call(|c| {
-            c.query_row("
-            select crsql_site_id(), (select max(db_version) from crsql_changes where site_id is null);
-            ", [], |row| {
+            c.query_row(
+                "
+                select crsql_site_id(), (select max(db_version) from crsql_changes where site_id is null);
+                ", [], |row| {
                 Ok((
                     row.get::<usize, Vec<u8>>(0)?,
                     row.get::<usize, i64>(1)?,
@@ -525,24 +570,24 @@ async fn changes(
         .call(move |c| {
             let mut stmt = c.prepare(
                 "
-            select
-                \"table\",
-                pk,
-                cid,
-                val,
-                col_version,
-                db_version,
-                cl,
-                seq
-            from crsql_changes
-            where db_version > ?
-            and site_id is null
-            ",
+select
+    \"table\",
+    pk,
+    cid,
+    val,
+    col_version,
+    db_version,
+    cl,
+    seq
+from crsql_changes
+where db_version > ?
+and site_id is null",
             )?;
             let changes_iter = stmt.query_map([since_db_version], |row| {
                 Ok(proto::Change {
                     table: row.get::<usize, String>(0)?,
-                    pk: String::from_utf8(row.get::<usize, Vec<u8>>(1)?).map_err(|e| rusqlite::Error::Utf8Error(e.utf8_error()))?,
+                    pk: String::from_utf8(row.get::<usize, Vec<u8>>(1)?)
+                        .map_err(|e| rusqlite::Error::Utf8Error(e.utf8_error()))?,
                     cid: row.get::<usize, String>(2)?,
                     val: row.get::<usize, String>(3)?.into_bytes(),
                     col_version: row.get::<usize, i64>(4)?,
