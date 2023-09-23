@@ -140,14 +140,3 @@ Some apps. Ideas for kinds of data that could be shared:
 - Code hosting to get this project off Git\*\*b
 
 Control via localhost or unix socket.
-
-## What's the thinking behind DDCP?
-
-Why do we need APIs, when we can share data directly?
-
-In a local-first world, what even is a "client" or "server"?
-
-There is only synchronization of my state, your state, their state. Make what you will of that state. Merge, copy, reference, or ignore parts or all of it as you like.
-
-Our applications should enable this kind of autonomy and optionality. User agents that work for us, not someone else's rent-seeking business model.
-

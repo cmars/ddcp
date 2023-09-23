@@ -105,9 +105,6 @@
 
           VEILID_SRC="${veilid_src}";
           LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
-
-          shellHook = ''
-          '';
         };
       }
     ));

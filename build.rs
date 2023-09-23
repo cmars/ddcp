@@ -2,15 +2,15 @@ use std::process::Command;
 
 fn main() {
     // Compile cr-sqlite
-    let output = Command::new("sh")
-        .args(["build_cr_sqlite.sh"])
+    let build_crsqlite_output = Command::new("sh")
+        .args(["scripts/build_cr_sqlite.sh"])
         .output()
         .expect("failed to build cr-sqlite");
-    if !output.status.success() {
+    if !build_crsqlite_output.status.success() {
         panic!(
             "{}\n{}",
-            String::from_utf8(output.stdout).expect("utf8"),
-            String::from_utf8(output.stderr).expect("utf8")
+            String::from_utf8(build_crsqlite_output.stdout).expect("utf8"),
+            String::from_utf8(build_crsqlite_output.stderr).expect("utf8")
         );
     }
 

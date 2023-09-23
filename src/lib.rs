@@ -1,6 +1,5 @@
-use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
-use clap::Parser;
 use flume::{unbounded, Receiver, Sender};
 use rusqlite::{params, OptionalExtension};
 use tokio::{select, signal, sync::oneshot, task::JoinHandle};
@@ -11,11 +10,10 @@ use veilid_core::{
     VeilidAPIResult, VeilidUpdate,
 };
 
-mod cli;
+pub mod cli;
 mod proto;
 mod veilid_config;
 
-use cli::{Cli, Commands, RemoteArgs, RemoteCommands};
 use proto::{Request, Response};
 
 #[derive(thiserror::Error, Debug)]
@@ -36,45 +34,6 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[tokio::main]
-async fn main() {
-    run().await.expect("ok");
-}
-
-async fn run() -> Result<()> {
-    let cli = cli::Cli::parse();
-    fs::DirBuilder::new()
-        .recursive(true)
-        .create(cli.app_dir())?;
-
-    let mut app = DDCP::new(&cli).await?;
-
-    if cli.needs_network() {
-        app.wait_for_network().await?;
-    }
-
-    let result = match cli.commands {
-        Commands::Init => app.init().await,
-        Commands::Push => app.push().await,
-        Commands::Remote(RemoteArgs {
-            commands: RemoteCommands::Add { name, addr },
-        }) => app.remote_add(name, addr).await,
-        Commands::Remote(RemoteArgs {
-            commands: RemoteCommands::Remove { name },
-        }) => app.remote_remove(name).await,
-        Commands::Remote(RemoteArgs {
-            commands: RemoteCommands::List,
-        }) => app.remote_list().await,
-        Commands::Serve => app.serve().await,
-        Commands::Cleanup => Ok(()),
-        Commands::Fetch { name } => app.fetch(name.as_str()).await,
-        _ => Err(Error::Other("unsupported command".to_string())),
-    };
-
-    app.cleanup().await?;
-    result
-}
-
 pub struct DDCP {
     conn: Connection,
     api: VeilidAPI,
@@ -89,10 +48,14 @@ const SUBKEY_SITE_ID: ValueSubkey = 0;
 const SUBKEY_DB_VERSION: ValueSubkey = 1;
 const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
 
+const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
+const CRSQL_TRACKED_EVENT_SEND: i32 = 1;
+const CRSQL_TRACKED_EVENT_DDCP_MERGE: i32 = 1000;
+
 impl DDCP {
-    pub async fn new(cli: &Cli) -> Result<DDCP> {
-        let conn = DDCP::new_connection(cli).await?;
-        let (api, updates) = DDCP::new_veilid_node(cli).await?;
+    pub async fn new(db_path: &str, state_path: &str, ext_path: &str) -> Result<DDCP> {
+        let conn = DDCP::new_connection(db_path, ext_path).await?;
+        let (api, updates) = DDCP::new_veilid_node(state_path).await?;
         let routing_context = api
             .routing_context()
             .with_sequencing(Sequencing::EnsureOrdered)
@@ -106,13 +69,13 @@ impl DDCP {
         })
     }
 
-    async fn new_connection(cli: &Cli) -> Result<Connection> {
-        let conn = Connection::open(cli.path("ddcp.db")).await?;
-        let ext_path = ext_path()?;
+    async fn new_connection(db_path: &str, ext_path: &str) -> Result<Connection> {
+        let conn = Connection::open(db_path).await?;
+        let load_ext_path = ext_path.to_owned();
         conn.call(move |c| {
             unsafe {
                 c.load_extension_enable()?;
-                let r = c.load_extension(ext_path.as_str(), Some("sqlite3_crsqlite_init"))?;
+                let r = c.load_extension(load_ext_path, Some("sqlite3_crsqlite_init"))?;
                 c.load_extension_disable()?;
                 r
             };
@@ -122,7 +85,7 @@ impl DDCP {
         Ok(conn)
     }
 
-    async fn new_veilid_node(cli: &Cli) -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
+    async fn new_veilid_node(state_path: &str) -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
         // Veilid API state channel
         let (node_sender, updates): (
             Sender<veilid_core::VeilidUpdate>,
@@ -133,9 +96,9 @@ impl DDCP {
         let update_callback = Arc::new(move |change: veilid_core::VeilidUpdate| {
             let _ = node_sender.send(change);
         });
-        let app_dir = Arc::new(cli.app_dir());
+        let config_state_path = Arc::new(state_path.to_owned());
         let config_callback =
-            Arc::new(move |key| veilid_config::callback(app_dir.to_string(), key));
+            Arc::new(move |key| veilid_config::callback(config_state_path.to_string(), key));
         let api: veilid_core::VeilidAPI =
             veilid_core::api_startup(update_callback, config_callback).await?;
         api.attach().await?;
@@ -184,7 +147,7 @@ impl DDCP {
             .call(|conn| {
                 conn.execute(
                     "
-                    create table if not exists nohub_remote_changes (
+                    create table if not exists ddcp_remote_changes (
                         \"table\" text not null,
                         pk text not null,
                         cid text not null,
@@ -193,8 +156,7 @@ impl DDCP {
                         db_version integer not null,
                         site_id blob not null,
                         cl integer not null,
-                        seq integer not null
-                    );
+                        seq integer not null);
                     ",
                     [],
                 )
@@ -310,7 +272,7 @@ where site_id = ? and event = 0",
                 let mut max_db_version = -1;
                 let mut stmt = tx.prepare(
                     "
-insert into nohub_remote_changes (
+insert into ddcp_remote_changes (
     \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
 )
 values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
@@ -336,7 +298,7 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
 insert into crsql_tracked_peers (site_id, version, event)
 values (?, ?, ?)
 on conflict do update set version = excluded.version",
-                    params![site_id, max_db_version, 0],
+                    params![site_id, max_db_version, CRSQL_TRACKED_EVENT_RECEIVE],
                 )?;
                 drop(stmt);
                 tx.commit()
@@ -345,7 +307,7 @@ on conflict do update set version = excluded.version",
         Ok(())
     }
 
-    // TODO: async fn pull, it's an insert into crsql_changes select from vlr_remote_changes
+    // TODO: async fn pull, it's an insert into crsql_changes select from ddcp_remote_changes
 
     async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match load_dht_keypair(&self.api, name).await? {
@@ -406,27 +368,19 @@ on conflict do update set version = excluded.version",
         Ok(())
     }
 
-    async fn remote_add(&self, name: String, addr: String) -> Result<()> {
+    pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
         let key = CryptoTyped::from_str(addr.as_str())?;
         store_dht_key(&self.api, &name, &key).await?;
         Ok(())
     }
 
-    async fn remote_remove(&self, name: String) -> Result<()> {
+    pub async fn remote_remove(&self, name: String) -> Result<()> {
         let db = &self.api.table_store()?.open("remote", 1).await?;
         db.delete(0, name.as_bytes()).await?;
         Ok(())
     }
 
-    async fn remote_list(&self) -> Result<()> {
-        let remotes = self.remotes().await?;
-        for (name, key) in remotes.iter() {
-            println!("{} {}", name, key.to_string());
-        }
-        Ok(())
-    }
-
-    async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
+    pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
         let db = &self.api.table_store()?.open("remote", 1).await?;
         let keys = db.get_keys(0).await?;
         let mut result = vec![];
@@ -439,7 +393,7 @@ on conflict do update set version = excluded.version",
         Ok(result)
     }
 
-    async fn serve(&mut self) -> Result<()> {
+    pub async fn serve(&mut self) -> Result<()> {
         // Create a private route and publish it
         let (route_id, route_blob) = self.api.new_private_route().await?;
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
@@ -519,8 +473,6 @@ on conflict do update set version = excluded.version",
             loop {
                 select! {
                     _ = timer.tick() => {
-                        // TODO: select! for shutdown signal
-                        timer.tick().await;
                         let (site_id, db_version) = status(&conn).await?;
                         if db_version <= prev_db_version {
                             continue;
@@ -544,17 +496,17 @@ on conflict do update set version = excluded.version",
 }
 
 async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
-    let (site_id, db_version) = conn.call(|c| {
+    let (site_id, db_version) = conn
+        .call(|c| {
             c.query_row(
                 "
-                select crsql_site_id(), (select max(db_version) from crsql_changes where site_id is null);
-                ", [], |row| {
-                Ok((
-                    row.get::<usize, Vec<u8>>(0)?,
-                    row.get::<usize, i64>(1)?,
-                ))
-            })
-        }).await?;
+select crsql_site_id(), (select max(db_version)
+from crsql_changes where site_id is null);",
+                [],
+                |row| Ok((row.get::<usize, Vec<u8>>(0)?, row.get::<usize, i64>(1)?)),
+            )
+        })
+        .await?;
     Ok((site_id, db_version))
 }
 
@@ -643,21 +595,9 @@ async fn store_dht_keypair(
 
 async fn store_dht_key(api: &VeilidAPI, name: &str, key: &TypedKey) -> VeilidAPIResult<()> {
     let db = api.table_store()?.open("remote", 1).await?;
-    db.store_json(0, name.as_bytes(), key).await
+    db.store_json(1, name.as_bytes(), key).await
 }
 
 fn other_err<T: ToString>(e: T) -> Error {
     Error::Other(e.to_string())
-}
-
-fn ext_path() -> Result<String> {
-    let exe = std::env::current_exe()?;
-    let exe_dir = exe.parent().expect("executable has a parent directory");
-    Ok(String::from(
-        exe_dir
-            .join(PathBuf::from("crsqlite"))
-            .as_os_str()
-            .to_str()
-            .expect("valid path string"),
-    ))
 }
