@@ -595,9 +595,9 @@ async fn store_dht_keypair(
 
 async fn store_dht_key(api: &VeilidAPI, name: &str, key: &TypedKey) -> VeilidAPIResult<()> {
     let db = api.table_store()?.open("remote", 1).await?;
-    db.store_json(1, name.as_bytes(), key).await
+    db.store_json(0, name.as_bytes(), key).await
 }
 
-fn other_err<T: ToString>(e: T) -> Error {
+pub fn other_err<T: ToString>(e: T) -> Error {
     Error::Other(e.to_string())
 }

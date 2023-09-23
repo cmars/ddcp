@@ -44,6 +44,7 @@ pub enum Commands {
     //Pull{ ... },
     Remote(RemoteArgs),
     Serve,
+    Shell,
     Cleanup,
 }
 
@@ -79,6 +80,7 @@ impl Cli {
     pub fn needs_network(&self) -> bool {
         match self.commands {
             Commands::Remote(_) => false,
+            Commands::Shell => false,
             _ => true,
         }
     }
