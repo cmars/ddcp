@@ -1,16 +1,8 @@
 # DDCP
 
-Database-to-Database Copy.
+Database-to-Database Copy (DDCP) over [Veilid](https://veilid.com).
 
-# What is it?
-
-Multi-master database synchronization with [VLCN](https://vlcn.io)'s [CR-SQLite](https://vlcn.io/docs/cr-sqlite/intro) over [Veilid](https://veilid.com).
-
-DDCP currently provides a Git-like CLI for fetching and merging SQLite database changes over Veilid.
-
-# Why would I use it?
-
-Distribute a SQLite database and synchronize it like a Git repository.
+`ddcp` provides a Git-like CLI for fetching and merging SQLite database changes with Veilid peers.
 
 # How do I use it?
 
