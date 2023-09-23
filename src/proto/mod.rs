@@ -1,4 +1,4 @@
 mod codec;
-mod velouria_capnp;
+mod ddcp_capnp;
 
 pub use codec::*;

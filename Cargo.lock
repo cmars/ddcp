@@ -829,6 +829,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2e66c9d817f1720209181c316d28635c050fa304f9c79e47a520882661b7308"
 
 [[package]]
+name = "ddcp"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+ "clap",
+ "flume",
+ "rusqlite",
+ "thiserror",
+ "tokio",
+ "tokio-rusqlite",
+ "veilid-core",
+ "xdg",
+]
+
+[[package]]
 name = "der"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3597,22 +3613,6 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "wasm-bindgen-futures",
-]
-
-[[package]]
-name = "velouria"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "capnpc",
- "clap",
- "flume",
- "rusqlite",
- "thiserror",
- "tokio",
- "tokio-rusqlite",
- "veilid-core",
- "xdg",
 ]
 
 [[package]]

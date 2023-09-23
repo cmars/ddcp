@@ -47,7 +47,7 @@ async fn run() -> Result<()> {
         .recursive(true)
         .create(cli.app_dir())?;
 
-    let mut app = Velouria::new(&cli).await?;
+    let mut app = DDCP::new(&cli).await?;
 
     if cli.needs_network() {
         app.wait_for_network().await?;
@@ -75,7 +75,7 @@ async fn run() -> Result<()> {
     result
 }
 
-pub struct Velouria {
+pub struct DDCP {
     conn: Connection,
     api: VeilidAPI,
     updates: Receiver<VeilidUpdate>,
@@ -89,15 +89,15 @@ const SUBKEY_SITE_ID: ValueSubkey = 0;
 const SUBKEY_DB_VERSION: ValueSubkey = 1;
 const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
 
-impl Velouria {
-    pub async fn new(cli: &Cli) -> Result<Velouria> {
-        let conn = Velouria::new_connection(cli).await?;
-        let (api, updates) = Velouria::new_veilid_node(cli).await?;
+impl DDCP {
+    pub async fn new(cli: &Cli) -> Result<DDCP> {
+        let conn = DDCP::new_connection(cli).await?;
+        let (api, updates) = DDCP::new_veilid_node(cli).await?;
         let routing_context = api
             .routing_context()
             .with_sequencing(Sequencing::EnsureOrdered)
             .with_privacy()?;
-        Ok(Velouria {
+        Ok(DDCP {
             conn,
             api,
             updates,
@@ -107,7 +107,7 @@ impl Velouria {
     }
 
     async fn new_connection(cli: &Cli) -> Result<Connection> {
-        let conn = Connection::open(cli.path("velouria.db")).await?;
+        let conn = Connection::open(cli.path("ddcp.db")).await?;
         let ext_path = ext_path()?;
         conn.call(move |c| {
             unsafe {
@@ -184,7 +184,7 @@ impl Velouria {
             .call(|conn| {
                 conn.execute(
                     "
-                    create table if not exists vlr_remote_changes (
+                    create table if not exists nohub_remote_changes (
                         \"table\" text not null,
                         pk text not null,
                         cid text not null,
@@ -310,7 +310,7 @@ where site_id = ? and event = 0",
                 let mut max_db_version = -1;
                 let mut stmt = tx.prepare(
                     "
-insert into vlr_remote_changes (
+insert into nohub_remote_changes (
     \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
 )
 values (?, ?, ?, ?, ?, ?, ?, ?, ?);",

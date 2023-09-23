@@ -1,5 +1,5 @@
 {
-  description = "velouria";
+  description = "ddcp";
 
   inputs = {
     nixpkgs.url = "nixpkgs";
@@ -95,6 +95,7 @@
             cargo-watch
             rustfmt
             rust-analyzer
+            rust-bin.nightly.latest.default
             clang
             llvmPackages.llvm
             llvmPackages.libclang
@@ -103,6 +104,7 @@
           ]);
 
           VEILID_SRC="${veilid_src}";
+          LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
 
           shellHook = ''
           '';

@@ -3,7 +3,7 @@ use capnp::{
     serialize,
 };
 
-use super::{velouria_capnp::request, velouria_capnp::response};
+use super::{ddcp_capnp::request, ddcp_capnp::response};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {

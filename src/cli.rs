@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::{command, Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "velouria")]
-#[command(bin_name = "velouria")]
+#[command(name = "ddcp")]
+#[command(bin_name = "ddcp")]
 pub struct Cli {
     #[arg(long)]
     pub app_dir: Option<String>,
@@ -73,7 +73,7 @@ impl Cli {
     }
 
     fn base_dirs(&self) -> xdg::BaseDirectories {
-        xdg::BaseDirectories::with_prefix("velouria").expect("XDG base directories")
+        xdg::BaseDirectories::with_prefix("ddcp").expect("XDG base directories")
     }
 }
 
