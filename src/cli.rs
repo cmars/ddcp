@@ -38,14 +38,16 @@ pub enum Commands {
     Push,
     Fetch {
         #[arg(required = false)]
-        name: String,
+        name: Option<String>,
     },
     Merge {
         #[arg(required = true)]
         name: String,
     },
-    //Merge{ ... },
-    //Pull{ ... },
+    Pull {
+        #[arg(required = false)]
+        name: Option<String>,
+    },
     Remote(RemoteArgs),
     Serve,
     Shell,

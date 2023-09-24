@@ -24,7 +24,6 @@
         arch = "x86_64";  # TODO: derive this from system?
         capnprotoVersion = "1.0.1";
         protobufVersion = "24.3";
-        veilidVersion = "0.2.3";
 
         capnproto_veilid = (with pkgs; stdenv.mkDerivation {
           pname = "capnproto";
@@ -65,31 +64,12 @@
           '';
         });
 
-        veilid_src = (with pkgs; stdenv.mkDerivation {
-          pname = "veilid";
-          version = "${veilidVersion}";
-          src = fetchgit {
-            url = "https://gitlab.com/veilid/veilid.git";
-            rev = "v${veilidVersion}";
-            hash = "sha256-fpA0JsBp2mlyDWlwE6xgyX5KNI2FSypO6m1J9BI+Kjs=";
-            fetchSubmodules = true;
-          };
-          buildPhase = ''
-            ls
-          '';
-          installPhase = ''
-            mkdir -p $out
-            tar cf - . | (cd $out; tar xf -)
-          '';
-        });
-
       in {
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
             capnproto_veilid
             protobuf_veilid
-            veilid_src
           ] ++ (with pkgs; [
             cargo
             cargo-watch
@@ -103,7 +83,6 @@
             sqlite
           ]);
 
-          VEILID_SRC="${veilid_src}";
           LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
         };
       }

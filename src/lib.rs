@@ -24,7 +24,7 @@ pub enum Error {
     IO(#[from] io::Error),
     #[error("veilid api error: {0}")]
     VeilidAPI(#[from] VeilidAPIError),
-    #[error("prorotcol error: {0}")]
+    #[error("protocol error: {0}")]
     Protocol(#[from] proto::Error),
     #[error("utf-8 encoding error: {0}")]
     Utf8(#[from] std::str::Utf8Error),
@@ -43,6 +43,12 @@ pub struct DDCP {
 }
 
 const LOCAL_KEYPAIR_NAME: &'static str = "__local";
+
+const TABLE_STORE_LOCAL: &'static str = "local";
+const TABLE_STORE_LOCAL_COLUMNS: u32 = 2;
+
+const TABLE_STORE_REMOTE: &'static str = "remote";
+const TABLE_STORE_REMOTE_COLUMNS: u32 = 2;
 
 const SUBKEY_SITE_ID: ValueSubkey = 0;
 const SUBKEY_DB_VERSION: ValueSubkey = 1;
@@ -134,17 +140,20 @@ impl DDCP {
         .await
     }
 
-    pub async fn init(&mut self) -> Result<()> {
+    pub async fn init(&mut self) -> Result<String> {
         // Initialize tracker table
         self.init_db().await?;
         // Load or create DHT key
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
-        println!("{}", local_dht.key().to_string());
+        let addr = local_dht.key().to_string();
+        // TODO: move console output to main
+        println!("{}", addr);
         self.dht_keypair = Some(local_dht);
-        Ok(())
+        Ok(addr)
     }
 
     async fn init_db(&self) -> Result<()> {
+        // TODO: good place to run schema migrations
         self.conn
             .call(|conn| {
                 conn.execute(
@@ -167,10 +176,12 @@ impl DDCP {
         Ok(())
     }
 
-    pub async fn push(&mut self) -> Result<()> {
+    pub async fn push(&mut self) -> Result<(String, Vec<u8>, i64)> {
         // Load or create DHT key
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
-        println!("{}", local_dht.key().to_string());
+        let addr = local_dht.key().to_string();
+        // TODO: move console output to main
+        println!("{}", addr);
         self.dht_keypair = Some(local_dht.clone());
 
         let key = local_dht.key().to_owned();
@@ -179,16 +190,16 @@ impl DDCP {
 
         // Push current db state
         self.routing_context
-            .set_dht_value(key, SUBKEY_SITE_ID, site_id)
+            .set_dht_value(key, SUBKEY_SITE_ID, site_id.clone())
             .await?;
         self.routing_context
             .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
             .await?;
 
-        Ok(())
+        Ok((addr, site_id, db_version))
     }
 
-    pub async fn fetch(&mut self, name: &str) -> Result<()> {
+    pub async fn fetch(&mut self, name: &str) -> Result<(bool, i64)> {
         // Get latest status from DHT
         let (site_id, db_version, route_blob) = self.remote_status(name).await?;
 
@@ -209,8 +220,9 @@ where site_id = ? and event = ? and version is not null",
         {
             Some(Some(tracked_version)) => {
                 if db_version <= tracked_version {
+                    // TODO: Move CLI output to main
                     eprintln!("remote {} is up to date", name);
-                    return Ok(());
+                    return Ok((false, db_version));
                 }
                 tracked_version
             }
@@ -233,7 +245,7 @@ where site_id = ? and event = ? and version is not null",
             self.stage(site_id, changes).await?;
         }
 
-        Ok(())
+        Ok((true, tracked_version))
     }
 
     async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
@@ -275,8 +287,9 @@ where site_id = ? and event = ? and version is not null",
         })
     }
 
-    async fn stage(&mut self, site_id: Vec<u8>, changes: Vec<proto::Change>) -> Result<()> {
-        self.conn
+    async fn stage(&mut self, site_id: Vec<u8>, changes: Vec<proto::Change>) -> Result<i64> {
+        let result = self
+            .conn
             .call(move |conn| {
                 let tx = conn.transaction()?;
                 let mut max_db_version = -1;
@@ -316,10 +329,11 @@ on conflict do update set version = excluded.version",
                     ],
                 )?;
                 drop(stmt);
-                tx.commit()
+                tx.commit()?;
+                Ok(max_db_version)
             })
             .await?;
-        Ok(())
+        Ok(result)
     }
 
     pub async fn merge(&mut self, name: &str) -> Result<()> {
@@ -371,12 +385,21 @@ from ddcp_remote_changes
 where site_id = ?
 order by db_version desc
 limit 1",
-                    params![CRSQL_TRACKED_TAG_WHOLE_DATABASE, CRSQL_TRACKED_EVENT_DDCP_MERGE, site_id],
+                    params![
+                        CRSQL_TRACKED_TAG_WHOLE_DATABASE,
+                        CRSQL_TRACKED_EVENT_DDCP_MERGE,
+                        site_id
+                    ],
                 )?;
                 tx.commit()
             })
             .await?;
         Ok(())
+    }
+
+    pub async fn pull(&mut self, name: &str) -> Result<()> {
+        self.fetch(name).await?;
+        self.merge(name).await
     }
 
     async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
@@ -408,6 +431,10 @@ limit 1",
     }
 
     pub async fn cleanup(self) -> Result<()> {
+        // Upgrade columns if necessary
+        let _ = self.api.table_store()?.open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS).await?;
+        let _ = self.api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
+
         // Attempt to close DHT record
         if let Some(local_dht) = self.dht_keypair {
             if let Err(e) = self
@@ -570,8 +597,7 @@ async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
         .call(|c| {
             c.query_row(
                 "
-select crsql_site_id(), (select max(db_version)
-from crsql_changes where site_id is null);",
+select crsql_site_id(), crsql_db_version();",
                 [],
                 |row| Ok((row.get::<usize, Vec<u8>>(0)?, row.get::<usize, i64>(1)?)),
             )
@@ -639,7 +665,7 @@ async fn load_local_keypair(
     api: &VeilidAPI,
     name: &str,
 ) -> VeilidAPIResult<Option<(TypedKey, KeyPair)>> {
-    let db = api.table_store()?.open("local", 2).await?;
+    let db = api.table_store()?.open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS).await?;
     let key = db.load_json::<TypedKey>(0, name.as_bytes()).await?;
     let owner = db.load_json::<KeyPair>(1, name.as_bytes()).await?;
     Ok(match (key, owner) {
@@ -652,7 +678,7 @@ async fn load_remote(
     api: &VeilidAPI,
     name: &str,
 ) -> VeilidAPIResult<(Option<TypedKey>, Option<Vec<u8>>)> {
-    let db = api.table_store()?.open("remote", 2).await?;
+    let db = api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
     let key = db.load_json::<TypedKey>(0, name.as_bytes()).await?;
     let site_id = db.load_json::<Vec<u8>>(1, name.as_bytes()).await?;
     Ok((key, site_id))
@@ -664,13 +690,13 @@ async fn store_local_keypair(
     key: &TypedKey,
     owner: KeyPair,
 ) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open("local", 2).await?;
+    let db = api.table_store()?.open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS).await?;
     db.store_json(0, name.as_bytes(), key).await?;
     db.store_json(1, name.as_bytes(), &owner).await
 }
 
 async fn store_remote_key(api: &VeilidAPI, name: &str, key: &TypedKey) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open("remote", 2).await?;
+    let db = api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
     db.store_json(0, name.as_bytes(), key).await
 }
 
@@ -679,7 +705,7 @@ async fn store_remote_site_id(
     name: &str,
     site_id: Vec<u8>,
 ) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open("remote", 2).await?;
+    let db = api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
     db.store_json(1, name.as_bytes(), &site_id).await
 }
 

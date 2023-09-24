@@ -1,3 +1,6 @@
 [submodule "external/cr-sqlite"]
 	path = external/cr-sqlite
 	url = https://github.com/vlcn-io/cr-sqlite
+[submodule "external/veilid"]
+	path = external/veilid
+	url = https://gitlab.com/veilid/veilid.git

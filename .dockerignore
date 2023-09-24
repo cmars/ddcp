@@ -1,4 +1,5 @@
 /target
-/.git
-/vendor
 /fixtures
+/Dockerfile
+/flake.*
+.git

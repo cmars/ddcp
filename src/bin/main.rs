@@ -21,8 +21,16 @@ async fn run() -> Result<()> {
     }
 
     let result = match cli.commands {
-        Commands::Init => app.init().await,
-        Commands::Push => app.push().await,
+        Commands::Init => {
+            let addr = app.init().await?;
+            println!("{}", addr);
+            Ok(())
+        }
+        Commands::Push => {
+            let (addr, _site_id, version) = app.push().await?;
+            println!("{} at version {}", addr, version);
+            Ok(())
+        }
         Commands::Remote(RemoteArgs {
             commands: RemoteCommands::Add { name, addr },
         }) => app.remote_add(name, addr).await,
@@ -49,8 +57,49 @@ async fn run() -> Result<()> {
             Err(other_err(format!("failed to exec sqlite3: {:?}", err)))
         }
         Commands::Cleanup => Ok(()),
-        Commands::Fetch { name } => app.fetch(name.as_str()).await,
+        Commands::Fetch { name } => {
+            match name {
+                Some(name) => {
+                    let _ = app.fetch(name.as_str()).await?;
+                    Ok(())
+                }
+                None => {
+                    let remotes = app.remotes().await?;
+                    let mut errors = vec![];
+                    for (name, _) in remotes.iter() {
+                        if let Err(e) = app.fetch(name).await {
+                            errors.push(format!("failed to fetch {}: {:?}", name, e));
+                        }
+                    }
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(other_err(errors.join("\n")))
+                    }
+                }
+            }
+        }
         Commands::Merge { name } => app.merge(name.as_str()).await,
+        Commands::Pull { name } => {
+            match name {
+                Some(name) => app.pull(name.as_str()).await,
+                None => {
+                    // TODO: refactor this (why does Fn passing have to be such a pain in Rust?)
+                    let remotes = app.remotes().await?;
+                    let mut errors = vec![];
+                    for (name, _) in remotes.iter() {
+                        if let Err(e) = app.pull(name).await {
+                            errors.push(format!("failed to fetch {}: {:?}", name, e));
+                        }
+                    }
+                    if errors.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(other_err(errors.join("\n")))
+                    }
+                }
+            }
+        }
         _ => Err(Error::Other("unsupported command".to_string())),
     };
 
