@@ -1287,7 +1287,7 @@ pub mod change {
       !self.reader.get_pointer_field(0).is_null()
     }
     #[inline]
-    pub fn get_pk(self) -> ::capnp::Result<::capnp::text::Reader<'a>> {
+    pub fn get_pk(self) -> ::capnp::Result<::capnp::data::Reader<'a>> {
       ::capnp::traits::FromPointerReader::get_from_pointer(&self.reader.get_pointer_field(1), ::core::option::Option::None)
     }
     #[inline]
@@ -1405,16 +1405,16 @@ pub mod change {
       !self.builder.is_pointer_field_null(0)
     }
     #[inline]
-    pub fn get_pk(self) -> ::capnp::Result<::capnp::text::Builder<'a>> {
+    pub fn get_pk(self) -> ::capnp::Result<::capnp::data::Builder<'a>> {
       ::capnp::traits::FromPointerBuilder::get_from_pointer(self.builder.get_pointer_field(1), ::core::option::Option::None)
     }
     #[inline]
-    pub fn set_pk(&mut self, value: ::capnp::text::Reader<'_>)  {
-      self.builder.reborrow().get_pointer_field(1).set_text(value);
+    pub fn set_pk(&mut self, value: ::capnp::data::Reader<'_>)  {
+      self.builder.reborrow().get_pointer_field(1).set_data(value);
     }
     #[inline]
-    pub fn init_pk(self, size: u32) -> ::capnp::text::Builder<'a> {
-      self.builder.get_pointer_field(1).init_text(size)
+    pub fn init_pk(self, size: u32) -> ::capnp::data::Builder<'a> {
+      self.builder.get_pointer_field(1).init_data(size)
     }
     #[inline]
     pub fn has_pk(&self) -> bool {
@@ -1601,11 +1601,11 @@ pub mod change {
       ::capnp::word(0, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(0, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(112, 107, 0, 0, 0, 0, 0, 0),
-      ::capnp::word(12, 0, 0, 0, 0, 0, 0, 0),
+      ::capnp::word(13, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(0, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(0, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(0, 0, 0, 0, 0, 0, 0, 0),
-      ::capnp::word(12, 0, 0, 0, 0, 0, 0, 0),
+      ::capnp::word(13, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(0, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(0, 0, 0, 0, 0, 0, 0, 0),
       ::capnp::word(99, 105, 100, 0, 0, 0, 0, 0),
@@ -1670,7 +1670,7 @@ pub mod change {
     pub fn get_field_types(index: u16) -> ::capnp::introspect::Type {
       match index {
         0 => <::capnp::text::Owned as ::capnp::introspect::Introspect>::introspect(),
-        1 => <::capnp::text::Owned as ::capnp::introspect::Introspect>::introspect(),
+        1 => <::capnp::data::Owned as ::capnp::introspect::Introspect>::introspect(),
         2 => <::capnp::text::Owned as ::capnp::introspect::Introspect>::introspect(),
         3 => <::capnp::data::Owned as ::capnp::introspect::Introspect>::introspect(),
         4 => <i64 as ::capnp::introspect::Introspect>::introspect(),

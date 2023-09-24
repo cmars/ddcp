@@ -40,6 +40,10 @@ pub enum Commands {
         #[arg(required = false)]
         name: String,
     },
+    Merge {
+        #[arg(required = true)]
+        name: String,
+    },
     //Merge{ ... },
     //Pull{ ... },
     Remote(RemoteArgs),
@@ -81,6 +85,7 @@ impl Cli {
         match self.commands {
             Commands::Remote(_) => false,
             Commands::Shell => false,
+            Commands::Merge{ name: _ } => false,
             _ => true,
         }
     }

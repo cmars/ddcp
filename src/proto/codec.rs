@@ -37,7 +37,7 @@ pub enum Response {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Change {
     pub table: String,
-    pub pk: String,
+    pub pk: Vec<u8>,
     pub cid: String,
     pub val: Vec<u8>,
     pub col_version: i64,
@@ -103,7 +103,7 @@ pub fn encode_response(response: Response, builder: &mut response::Builder) -> R
             for i in 0..changes.len() {
                 let mut build_change = build_changes_changes.reborrow().get(i as u32);
                 build_change.set_table(changes[i].table.as_str().into());
-                build_change.set_pk(changes[i].pk.as_str().into());
+                build_change.set_pk(changes[i].pk.as_slice());
                 build_change.set_cid(changes[i].cid.as_str().into());
                 build_change.set_val(changes[i].val.as_slice());
                 build_change.set_col_version(changes[i].col_version);
@@ -138,7 +138,7 @@ pub fn decode_response(reader: &response::Reader) -> Result<Response> {
                 let change = changes_changes.get(i);
                 resp_changes.push(Change {
                     table: change.get_table()?.to_string()?,
-                    pk: change.get_pk()?.to_string()?,
+                    pk: change.get_pk()?.to_vec(),
                     cid: change.get_cid()?.to_string()?,
                     val: change.get_val()?.to_vec(),
                     col_version: change.get_col_version(),
@@ -221,7 +221,7 @@ mod tests {
         let changes = vec![
             Change {
                 table: "some_table".to_owned(),
-                pk: "some_pk".to_owned(),
+                pk: "some_pk".to_string().into_bytes(),
                 cid: "el_cid".to_owned(),
                 val: vec![0xa5u8, 8],
                 col_version: 23,
@@ -231,7 +231,7 @@ mod tests {
             },
             Change {
                 table: "some_other_table".to_owned(),
-                pk: "some_other_pk".to_owned(),
+                pk: "some_other_pk".to_string().into_bytes(),
                 cid: "a_cid".to_owned(),
                 val: vec![0x5au8, 8],
                 col_version: 32,

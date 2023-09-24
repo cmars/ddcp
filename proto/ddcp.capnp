@@ -30,7 +30,7 @@ struct Status {
 
 struct Change {
     table @0 :Text;
-    pk @1 :Text;
+    pk @1 :Data;
     cid @2 :Text;
     val @3 :Data;
     colVersion @4 :Int64;

@@ -34,11 +34,12 @@ RUN cargo build --release
 
 ### Runtime
 
-FROM gcr.io/distroless/static-debian12
-COPY --from=builder /src/target/release/ddcp /ddcp
-COPY --from=builder /src/target/release/crsqlite.so /crsqlite.so
+FROM debian:bookworm-slim
+RUN apt-update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3
+COPY --from=builder /src/target/release/ddcp /usr/bin/ddcp
+COPY --from=builder /src/target/release/crsqlite.so /usr/lib/crsqlite.so
 ENV DB_FILE /data/db
 ENV STATE_DIR /data/state
-ENV EXT_FILE /crsqlite.so
+ENV EXT_FILE /usr/lib/crsqlite.so
 VOLUME /data
-ENTRYPOINT ["/ddcp"]
+ENTRYPOINT ["/usr/bin/ddcp"]

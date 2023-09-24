@@ -48,8 +48,10 @@ const SUBKEY_SITE_ID: ValueSubkey = 0;
 const SUBKEY_DB_VERSION: ValueSubkey = 1;
 const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
 
+const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
+
 const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
-const CRSQL_TRACKED_EVENT_SEND: i32 = 1;
+//const CRSQL_TRACKED_EVENT_SEND: i32 = 1;
 const CRSQL_TRACKED_EVENT_DDCP_MERGE: i32 = 1000;
 
 impl DDCP {
@@ -193,26 +195,26 @@ impl DDCP {
         // Do we need to fetch newer versions?
         let tracked_version = match self
             .conn
-            .call(|conn| {
+            .call(move |conn| {
                 conn.query_row(
                     "
-select max(db_version) from crsql_tracked_peers
-where site_id = ? and event = 0",
-                    [site_id],
-                    |row| row.get::<usize, i64>(0),
+select max(version) from crsql_tracked_peers
+where site_id = ? and event = ? and version is not null",
+                    params![site_id, CRSQL_TRACKED_EVENT_RECEIVE],
+                    |row| row.get::<usize, Option<i64>>(0),
                 )
                 .optional()
             })
             .await?
         {
-            Some(tracked_version) => {
+            Some(Some(tracked_version)) => {
                 if db_version <= tracked_version {
                     eprintln!("remote {} is up to date", name);
                     return Ok(());
                 }
                 tracked_version
             }
-            None => -1,
+            _ => -1,
         };
 
         let route_id = self.api.import_remote_private_route(route_blob)?;
@@ -235,7 +237,8 @@ where site_id = ? and event = 0",
     }
 
     async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
-        let dht = match load_dht_key(&self.api, name).await? {
+        let (prior_dht_key, prior_site_id) = load_remote(&self.api, name).await?;
+        let dht = match prior_dht_key {
             Some(key) => self.routing_context.open_dht_record(key, None).await?,
             None => return Err(other_err(format!("remote {} not found", name))),
         };
@@ -251,6 +254,13 @@ where site_id = ? and event = 0",
             .routing_context
             .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
             .await?;
+
+        match (prior_site_id, &maybe_site_id) {
+            (None, Some(site_id)) => {
+                store_remote_site_id(&self.api, name, site_id.data().to_owned()).await?;
+            }
+            _ => {}
+        };
 
         Ok(match (maybe_site_id, maybe_db_version, maybe_route_blob) {
             (Some(sid), Some(dbv), Some(rt)) => {
@@ -295,10 +305,15 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 }
                 tx.execute(
                     "
-insert into crsql_tracked_peers (site_id, version, event)
-values (?, ?, ?)
+insert into crsql_tracked_peers (site_id, version, tag, event)
+values (?, ?, ?, ?)
 on conflict do update set version = excluded.version",
-                    params![site_id, max_db_version, CRSQL_TRACKED_EVENT_RECEIVE],
+                    params![
+                        site_id,
+                        max_db_version,
+                        CRSQL_TRACKED_TAG_WHOLE_DATABASE,
+                        CRSQL_TRACKED_EVENT_RECEIVE
+                    ],
                 )?;
                 drop(stmt);
                 tx.commit()
@@ -307,10 +322,65 @@ on conflict do update set version = excluded.version",
         Ok(())
     }
 
-    // TODO: async fn pull, it's an insert into crsql_changes select from ddcp_remote_changes
+    pub async fn merge(&mut self, name: &str) -> Result<()> {
+        let site_id = if let (Some(_), Some(site_id)) = load_remote(&self.api, name).await? {
+            site_id
+        } else {
+            return Err(other_err(format!(
+                "cannot merge from {}; no site_id: try fetching first",
+                name
+            )));
+        };
+        self.conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let max_db_version = match tx
+                    .query_row(
+                        "
+select cast(max(version) as integer) as max_version from crsql_tracked_peers
+where site_id = ? and tag = ? and event = ?",
+                        params![
+                            site_id,
+                            CRSQL_TRACKED_TAG_WHOLE_DATABASE,
+                            CRSQL_TRACKED_EVENT_DDCP_MERGE
+                        ],
+                        |row| row.get::<usize, Option<i64>>(0),
+                    )
+                    .optional()?
+                {
+                    Some(Some(version)) => version,
+                    _ => -1,
+                };
+                tx.execute(
+                    "
+insert into crsql_changes (
+    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
+select
+    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
+from ddcp_remote_changes
+where site_id = ?
+and db_version > ?",
+                    params![site_id, max_db_version],
+                )?;
+                tx.execute(
+                    "
+insert into crsql_tracked_peers (
+    site_id, version, tag, event)
+select site_id, max(db_version), ?, ?
+from ddcp_remote_changes
+where site_id = ?
+order by db_version desc
+limit 1",
+                    params![CRSQL_TRACKED_TAG_WHOLE_DATABASE, CRSQL_TRACKED_EVENT_DDCP_MERGE, site_id],
+                )?;
+                tx.commit()
+            })
+            .await?;
+        Ok(())
+    }
 
     async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
-        let dht = match load_dht_keypair(&self.api, name).await? {
+        let dht = match load_local_keypair(&self.api, name).await? {
             Some((key, owner)) => {
                 self.routing_context
                     .open_dht_record(key, Some(owner))
@@ -321,7 +391,7 @@ on conflict do update set version = excluded.version",
                     .routing_context
                     .create_dht_record(DHTSchema::DFLT(DHTSchemaDFLT { o_cnt: 3 }), None)
                     .await?;
-                store_dht_keypair(
+                store_local_keypair(
                     &self.api,
                     name,
                     new_dht.key(),
@@ -370,7 +440,7 @@ on conflict do update set version = excluded.version",
 
     pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
         let key = CryptoTyped::from_str(addr.as_str())?;
-        store_dht_key(&self.api, &name, &key).await?;
+        store_remote_key(&self.api, &name, &key).await?;
         Ok(())
     }
 
@@ -386,7 +456,7 @@ on conflict do update set version = excluded.version",
         let mut result = vec![];
         for db_key in keys.iter() {
             let name = std::str::from_utf8(db_key.as_slice())?.to_owned();
-            if let Some(remote_key) = load_dht_key(&self.api, name.as_str()).await? {
+            if let (Some(remote_key), _) = load_remote(&self.api, name.as_str()).await? {
                 result.push((name, remote_key));
             }
         }
@@ -526,7 +596,7 @@ select
     \"table\",
     pk,
     cid,
-    val,
+    cast(val as blob) as val,
     col_version,
     db_version,
     cl,
@@ -538,10 +608,12 @@ and site_id is null",
             let changes_iter = stmt.query_map([since_db_version], |row| {
                 Ok(proto::Change {
                     table: row.get::<usize, String>(0)?,
-                    pk: String::from_utf8(row.get::<usize, Vec<u8>>(1)?)
-                        .map_err(|e| rusqlite::Error::Utf8Error(e.utf8_error()))?,
+                    pk: row.get::<usize, Vec<u8>>(1)?,
                     cid: row.get::<usize, String>(2)?,
-                    val: row.get::<usize, String>(3)?.into_bytes(),
+                    val: match row.get::<usize, Option<Vec<u8>>>(3)? {
+                        Some(val) => val,
+                        None => vec![],
+                    },
                     col_version: row.get::<usize, i64>(4)?,
                     db_version: row.get::<usize, i64>(5)?,
                     cl: row.get::<usize, i64>(6)?,
@@ -563,7 +635,7 @@ and site_id is null",
     Ok((site_id, changes))
 }
 
-async fn load_dht_keypair(
+async fn load_local_keypair(
     api: &VeilidAPI,
     name: &str,
 ) -> VeilidAPIResult<Option<(TypedKey, KeyPair)>> {
@@ -576,13 +648,17 @@ async fn load_dht_keypair(
     })
 }
 
-async fn load_dht_key(api: &VeilidAPI, name: &str) -> VeilidAPIResult<Option<TypedKey>> {
-    let db = api.table_store()?.open("remote", 1).await?;
+async fn load_remote(
+    api: &VeilidAPI,
+    name: &str,
+) -> VeilidAPIResult<(Option<TypedKey>, Option<Vec<u8>>)> {
+    let db = api.table_store()?.open("remote", 2).await?;
     let key = db.load_json::<TypedKey>(0, name.as_bytes()).await?;
-    Ok(key)
+    let site_id = db.load_json::<Vec<u8>>(1, name.as_bytes()).await?;
+    Ok((key, site_id))
 }
 
-async fn store_dht_keypair(
+async fn store_local_keypair(
     api: &VeilidAPI,
     name: &str,
     key: &TypedKey,
@@ -593,9 +669,18 @@ async fn store_dht_keypair(
     db.store_json(1, name.as_bytes(), &owner).await
 }
 
-async fn store_dht_key(api: &VeilidAPI, name: &str, key: &TypedKey) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open("remote", 1).await?;
+async fn store_remote_key(api: &VeilidAPI, name: &str, key: &TypedKey) -> VeilidAPIResult<()> {
+    let db = api.table_store()?.open("remote", 2).await?;
     db.store_json(0, name.as_bytes(), key).await
+}
+
+async fn store_remote_site_id(
+    api: &VeilidAPI,
+    name: &str,
+    site_id: Vec<u8>,
+) -> VeilidAPIResult<()> {
+    let db = api.table_store()?.open("remote", 2).await?;
+    db.store_json(1, name.as_bytes(), &site_id).await
 }
 
 pub fn other_err<T: ToString>(e: T) -> Error {

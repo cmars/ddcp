@@ -50,6 +50,7 @@ async fn run() -> Result<()> {
         }
         Commands::Cleanup => Ok(()),
         Commands::Fetch { name } => app.fetch(name.as_str()).await,
+        Commands::Merge { name } => app.merge(name.as_str()).await,
         _ => Err(Error::Other("unsupported command".to_string())),
     };
 
