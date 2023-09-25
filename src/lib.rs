@@ -1,4 +1,4 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
 use rusqlite::{params, OptionalExtension};
@@ -6,49 +6,34 @@ use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    RoutingContext, Sequencing, Target, TypedKey, ValueSubkey, VeilidAPI, VeilidAPIError,
-    VeilidAPIResult, VeilidUpdate,
+    Sequencing, Target, ValueSubkey, VeilidUpdate,
 };
 
 pub mod cli;
+mod error;
+mod node;
 mod proto;
-mod veilid_config;
+mod store;
+pub mod veilid_config;
 
+pub use error::{other_err, Error, Result};
+pub use node::{Node, VeilidNode};
 use proto::{Request, Response};
+use store::{
+    load_local_keypair, load_remote, store_local_keypair, store_remote_key, store_remote_site_id,
+};
 
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("db error: {0}")]
-    DB(#[from] tokio_rusqlite::Error),
-    #[error("io error: {0}")]
-    IO(#[from] io::Error),
-    #[error("veilid api error: {0}")]
-    VeilidAPI(#[from] VeilidAPIError),
-    #[error("protocol error: {0}")]
-    Protocol(#[from] proto::Error),
-    #[error("utf-8 encoding error: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
-    #[error("other: {0}")]
-    Other(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+use crate::store::{
+    TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS, TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS,
+};
 
 pub struct DDCP {
     conn: Connection,
-    api: VeilidAPI,
-    updates: Receiver<VeilidUpdate>,
-    routing_context: RoutingContext,
+    node: Box<dyn Node>,
     dht_keypair: Option<DHTRecordDescriptor>,
 }
 
 const LOCAL_KEYPAIR_NAME: &'static str = "__local";
-
-const TABLE_STORE_LOCAL: &'static str = "local";
-const TABLE_STORE_LOCAL_COLUMNS: u32 = 2;
-
-const TABLE_STORE_REMOTE: &'static str = "remote";
-const TABLE_STORE_REMOTE_COLUMNS: u32 = 2;
 
 const SUBKEY_SITE_ID: ValueSubkey = 0;
 const SUBKEY_DB_VERSION: ValueSubkey = 1;
@@ -61,24 +46,32 @@ const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
 const CRSQL_TRACKED_EVENT_DDCP_MERGE: i32 = 1000;
 
 impl DDCP {
-    pub async fn new(db_path: &str, state_path: &str, ext_path: &str) -> Result<DDCP> {
+    pub async fn new(db_path: Option<&str>, state_path: &str, ext_path: &str) -> Result<DDCP> {
         let conn = DDCP::new_connection(db_path, ext_path).await?;
-        let (api, updates) = DDCP::new_veilid_node(state_path).await?;
-        let routing_context = api
-            .routing_context()
-            .with_sequencing(Sequencing::EnsureOrdered)
-            .with_privacy()?;
+        let node = DDCP::new_veilid_node(state_path).await?;
         Ok(DDCP {
             conn,
-            api,
-            updates,
-            routing_context,
+            node,
             dht_keypair: None,
         })
     }
 
-    async fn new_connection(db_path: &str, ext_path: &str) -> Result<Connection> {
-        let conn = Connection::open(db_path).await?;
+    pub fn new_conn_node(conn: Connection, node: Box<dyn Node>) -> DDCP {
+        DDCP {
+            conn,
+            node,
+            dht_keypair: None,
+        }
+    }
+
+    pub async fn new_connection(
+        db_path: Option<&str>,
+        ext_path: &str,
+    ) -> Result<Connection> {
+        let conn = match db_path {
+            Some(path) => Connection::open(path).await,
+            None => Connection::open_in_memory().await,
+        }?;
         let load_ext_path = ext_path.to_owned();
         conn.call(move |c| {
             unsafe {
@@ -93,7 +86,7 @@ impl DDCP {
         Ok(conn)
     }
 
-    async fn new_veilid_node(state_path: &str) -> Result<(VeilidAPI, Receiver<VeilidUpdate>)> {
+    async fn new_veilid_node(state_path: &str) -> Result<Box<dyn Node>> {
         // Veilid API state channel
         let (node_sender, updates): (
             Sender<veilid_core::VeilidUpdate>,
@@ -107,37 +100,21 @@ impl DDCP {
         let config_state_path = Arc::new(state_path.to_owned());
         let config_callback =
             Arc::new(move |key| veilid_config::callback(config_state_path.to_string(), key));
+
         let api: veilid_core::VeilidAPI =
             veilid_core::api_startup(update_callback, config_callback).await?;
         api.attach().await?;
-        Ok((api, updates))
+
+        let routing_context = api
+            .routing_context()
+            .with_sequencing(Sequencing::EnsureOrdered)
+            .with_privacy()?;
+
+        Ok(VeilidNode::new(routing_context, updates))
     }
 
     pub async fn wait_for_network(&self) -> Result<()> {
-        // Wait for network to be up
-        async {
-            loop {
-                let res = self.updates.recv_async().await;
-                match res {
-                    Ok(VeilidUpdate::Attachment(attachment)) => {
-                        eprintln!("{:?}", attachment);
-                        if attachment.public_internet_ready {
-                            return Ok(());
-                        }
-                    }
-                    Ok(VeilidUpdate::Config(_)) => {}
-                    Ok(VeilidUpdate::Log(_)) => {}
-                    Ok(VeilidUpdate::Network(_)) => {}
-                    Ok(u) => {
-                        eprintln!("{:?}", u);
-                    }
-                    Err(e) => {
-                        return Err(Error::Other(e.to_string()));
-                    }
-                };
-            }
-        }
-        .await
+        self.node.wait_for_network().await
     }
 
     pub async fn init(&mut self) -> Result<String> {
@@ -189,10 +166,10 @@ impl DDCP {
         let (site_id, db_version) = status(&self.conn).await?;
 
         // Push current db state
-        self.routing_context
+        self.node
             .set_dht_value(key, SUBKEY_SITE_ID, site_id.clone())
             .await?;
-        self.routing_context
+        self.node
             .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
             .await?;
 
@@ -229,9 +206,9 @@ where site_id = ? and event = ? and version is not null",
             _ => -1,
         };
 
-        let route_id = self.api.import_remote_private_route(route_blob)?;
+        let route_id = self.node.import_remote_private_route(route_blob)?;
         let msg_bytes = self
-            .routing_context
+            .node
             .app_call(
                 Target::PrivateRoute(route_id),
                 proto::encode_request_message(Request::Changes {
@@ -249,27 +226,27 @@ where site_id = ? and event = ? and version is not null",
     }
 
     async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
-        let (prior_dht_key, prior_site_id) = load_remote(&self.api, name).await?;
+        let (prior_dht_key, prior_site_id) = load_remote(self.node.api(), name).await?;
         let dht = match prior_dht_key {
-            Some(key) => self.routing_context.open_dht_record(key, None).await?,
+            Some(key) => self.node.open_dht_record(key, None).await?,
             None => return Err(other_err(format!("remote {} not found", name))),
         };
         let maybe_site_id = self
-            .routing_context
+            .node
             .get_dht_value(dht.key().to_owned(), SUBKEY_SITE_ID, true)
             .await?;
         let maybe_db_version = self
-            .routing_context
+            .node
             .get_dht_value(dht.key().to_owned(), SUBKEY_DB_VERSION, true)
             .await?;
         let maybe_route_blob = self
-            .routing_context
+            .node
             .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
             .await?;
 
         match (prior_site_id, &maybe_site_id) {
             (None, Some(site_id)) => {
-                store_remote_site_id(&self.api, name, site_id.data().to_owned()).await?;
+                store_remote_site_id(self.node.api(), name, site_id.data().to_owned()).await?;
             }
             _ => {}
         };
@@ -337,7 +314,7 @@ on conflict do update set version = excluded.version",
     }
 
     pub async fn merge(&mut self, name: &str) -> Result<()> {
-        let site_id = if let (Some(_), Some(site_id)) = load_remote(&self.api, name).await? {
+        let site_id = if let (Some(_), Some(site_id)) = load_remote(self.node.api(), name).await? {
             site_id
         } else {
             return Err(other_err(format!(
@@ -403,19 +380,15 @@ limit 1",
     }
 
     async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
-        let dht = match load_local_keypair(&self.api, name).await? {
-            Some((key, owner)) => {
-                self.routing_context
-                    .open_dht_record(key, Some(owner))
-                    .await?
-            }
+        let dht = match load_local_keypair(self.node.api(), name).await? {
+            Some((key, owner)) => self.node.open_dht_record(key, Some(owner)).await?,
             None => {
                 let new_dht = self
-                    .routing_context
+                    .node
                     .create_dht_record(DHTSchema::DFLT(DHTSchemaDFLT { o_cnt: 3 }), None)
                     .await?;
                 store_local_keypair(
-                    &self.api,
+                    self.node.api(),
                     name,
                     new_dht.key(),
                     KeyPair::new(
@@ -432,26 +405,28 @@ limit 1",
 
     pub async fn cleanup(self) -> Result<()> {
         // Upgrade columns if necessary
-        let _ = self.api.table_store()?.open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS).await?;
-        let _ = self.api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
+        let _ = self
+            .node
+            .api()
+            .table_store()?
+            .open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS)
+            .await?;
+        let _ = self
+            .node
+            .api()
+            .table_store()?
+            .open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS)
+            .await?;
 
         // Attempt to close DHT record
         if let Some(local_dht) = self.dht_keypair {
-            if let Err(e) = self
-                .routing_context
-                .close_dht_record(local_dht.key().to_owned())
-                .await
-            {
+            if let Err(e) = self.node.close_dht_record(local_dht.key().to_owned()).await {
                 eprintln!("failed to close DHT record: {:?}", e);
             }
         }
 
         // Shut down Veilid node
-        eprintln!("detach");
-        self.api.detach().await?;
-        eprintln!("shutting down");
-        self.api.shutdown().await;
-        eprintln!("shutdown");
+        self.node.shutdown().await?;
 
         // Finalize cr-sqlite db
         self.conn
@@ -467,23 +442,23 @@ limit 1",
 
     pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
         let key = CryptoTyped::from_str(addr.as_str())?;
-        store_remote_key(&self.api, &name, &key).await?;
+        store_remote_key(self.node.api(), &name, &key).await?;
         Ok(())
     }
 
     pub async fn remote_remove(&self, name: String) -> Result<()> {
-        let db = &self.api.table_store()?.open("remote", 1).await?;
+        let db = self.node.api().table_store()?.open("remote", 1).await?;
         db.delete(0, name.as_bytes()).await?;
         Ok(())
     }
 
     pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
-        let db = &self.api.table_store()?.open("remote", 1).await?;
+        let db = self.node.api().table_store()?.open("remote", 1).await?;
         let keys = db.get_keys(0).await?;
         let mut result = vec![];
         for db_key in keys.iter() {
             let name = std::str::from_utf8(db_key.as_slice())?.to_owned();
-            if let (Some(remote_key), _) = load_remote(&self.api, name.as_str()).await? {
+            if let (Some(remote_key), _) = load_remote(self.node.api(), name.as_str()).await? {
                 result.push((name, remote_key));
             }
         }
@@ -492,10 +467,10 @@ limit 1",
 
     pub async fn serve(&mut self) -> Result<()> {
         // Create a private route and publish it
-        let (route_id, route_blob) = self.api.new_private_route().await?;
+        let (route_id, route_blob) = self.node.new_private_route().await?;
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         self.dht_keypair = Some(local_dht.clone());
-        self.routing_context
+        self.node
             .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
             .await?;
 
@@ -507,38 +482,9 @@ limit 1",
         // Handle requests from peers
         loop {
             select! {
-                res = self.updates.recv_async() => {
+                res = self.node.recv_updates_async() => {
                     match res {
-                        Ok(VeilidUpdate::AppCall(app_call)) => {
-                            let request = match proto::decode_request_message(app_call.message()) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    eprintln!("invalid request: {:?}", e);
-                                    continue
-                                }
-                            };
-                            match request {
-                                Request::Status => {
-                                    // TODO: spawn responder to unblock event loop
-                                    let (site_id, db_version) = status(&self.conn).await?;
-                                    let resp = proto::encode_response_message(Response::Status {
-                                        site_id,
-                                        db_version,
-                                    })?;
-                                    self.api.app_call_reply(app_call.id(), resp).await?;
-                                }
-                                Request::Changes { since_db_version } => {
-                                    let (site_id, changes) = changes(&self.conn, since_db_version).await?;
-                                    let resp = proto::encode_response_message(Response::Changes{
-                                        site_id,
-                                        changes,
-                                    })?;
-                                    self.api.app_call_reply(app_call.id(), resp).await?;
-                                }
-                            }
-                        }
-                        Ok(VeilidUpdate::Shutdown) => return Ok(()),
-                        Ok(_) => {}
+                        Ok(update) => self.handle_update(update).await?,
                         Err(e) => return Err(other_err(e)),
                     }
                 }
@@ -549,8 +495,44 @@ limit 1",
                 }
             }
         }
-        self.api.release_private_route(route_id)?;
+        self.node.release_private_route(route_id)?;
         tracker_handle.await.map_err(other_err)??;
+        Ok(())
+    }
+
+    pub(crate) async fn handle_update(&mut self, update: VeilidUpdate) -> Result<()> {
+        match update {
+            VeilidUpdate::AppCall(app_call) => {
+                let request = match proto::decode_request_message(app_call.message()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("invalid request: {:?}", e);
+                        return Ok(());
+                    }
+                };
+                match request {
+                    Request::Status => {
+                        // TODO: spawn responder to unblock event loop
+                        let (site_id, db_version) = status(&self.conn).await?;
+                        let resp = proto::encode_response_message(Response::Status {
+                            site_id,
+                            db_version,
+                        })?;
+                        self.node.app_call_reply(app_call.id(), resp).await?;
+                    }
+                    Request::Changes { since_db_version } => {
+                        let (site_id, changes) = changes(&self.conn, since_db_version).await?;
+                        let resp =
+                            proto::encode_response_message(Response::Changes { site_id, changes })?;
+                        self.node.app_call_reply(app_call.id(), resp).await?;
+                    }
+                }
+            }
+            VeilidUpdate::Shutdown => {
+                return Err(Error::VeilidAPI(veilid_core::VeilidAPIError::Shutdown))
+            }
+            _ => return Ok(()),
+        }
         Ok(())
     }
 
@@ -561,7 +543,7 @@ limit 1",
         local_dht: DHTRecordDescriptor,
     ) -> Result<JoinHandle<Result<()>>> {
         let conn = self.conn.clone();
-        let routing_context = self.routing_context.clone();
+        let node = self.node.clone_box();
         let key = local_dht.key().to_owned();
         let mut timer = tokio::time::interval(Duration::from_secs(60));
 
@@ -575,8 +557,8 @@ limit 1",
                             continue;
                         }
 
-                        routing_context.set_dht_value(key, SUBKEY_SITE_ID, site_id).await?;
-                        routing_context
+                        node.set_dht_value(key, SUBKEY_SITE_ID, site_id).await?;
+                        node
                             .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
                             .await?;
                         prev_db_version = db_version;
@@ -659,56 +641,4 @@ and site_id is null",
         })
         .await?;
     Ok((site_id, changes))
-}
-
-async fn load_local_keypair(
-    api: &VeilidAPI,
-    name: &str,
-) -> VeilidAPIResult<Option<(TypedKey, KeyPair)>> {
-    let db = api.table_store()?.open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS).await?;
-    let key = db.load_json::<TypedKey>(0, name.as_bytes()).await?;
-    let owner = db.load_json::<KeyPair>(1, name.as_bytes()).await?;
-    Ok(match (key, owner) {
-        (Some(k), Some(o)) => Some((k, o)),
-        _ => None,
-    })
-}
-
-async fn load_remote(
-    api: &VeilidAPI,
-    name: &str,
-) -> VeilidAPIResult<(Option<TypedKey>, Option<Vec<u8>>)> {
-    let db = api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
-    let key = db.load_json::<TypedKey>(0, name.as_bytes()).await?;
-    let site_id = db.load_json::<Vec<u8>>(1, name.as_bytes()).await?;
-    Ok((key, site_id))
-}
-
-async fn store_local_keypair(
-    api: &VeilidAPI,
-    name: &str,
-    key: &TypedKey,
-    owner: KeyPair,
-) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS).await?;
-    db.store_json(0, name.as_bytes(), key).await?;
-    db.store_json(1, name.as_bytes(), &owner).await
-}
-
-async fn store_remote_key(api: &VeilidAPI, name: &str, key: &TypedKey) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
-    db.store_json(0, name.as_bytes(), key).await
-}
-
-async fn store_remote_site_id(
-    api: &VeilidAPI,
-    name: &str,
-    site_id: Vec<u8>,
-) -> VeilidAPIResult<()> {
-    let db = api.table_store()?.open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS).await?;
-    db.store_json(1, name.as_bytes(), &site_id).await
-}
-
-pub fn other_err<T: ToString>(e: T) -> Error {
-    Error::Other(e.to_string())
 }

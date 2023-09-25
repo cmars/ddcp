@@ -5,7 +5,7 @@ use std::{
 
 use clap::{command, Args, Parser, Subcommand};
 
-use crate::{other_err, Error, Result};
+use crate::error::{other_err, Error, Result};
 
 #[derive(Parser, Debug)]
 #[command(name = "ddcp")]
@@ -181,7 +181,7 @@ impl Cli {
     }
 }
 
-fn path_as_string(p: PathBuf) -> Result<String> {
+pub fn path_as_string(p: PathBuf) -> Result<String> {
     p.as_os_str()
         .to_os_string()
         .into_string()

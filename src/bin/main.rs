@@ -14,7 +14,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     let (db_file, state_dir, ext_file) = (cli.db_file()?, cli.state_dir()?, cli.ext_file()?);
-    let mut app = DDCP::new(db_file.as_str(), state_dir.as_str(), ext_file.as_str()).await?;
+    let mut app = DDCP::new(Some(db_file.as_str()), state_dir.as_str(), ext_file.as_str()).await?;
 
     if cli.needs_network() {
         app.wait_for_network().await?;
