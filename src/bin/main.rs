@@ -1,4 +1,7 @@
 use clap::Parser;
+use tracing::{error, info};
+use tracing_subscriber::filter::{self, EnvFilter};
+use tracing_subscriber::prelude::*;
 
 use ddcp::{
     cli::{Cli, Commands, RemoteArgs, RemoteCommands},
@@ -7,7 +10,19 @@ use ddcp::{
 
 #[tokio::main]
 async fn main() {
-    run().await.expect("ok");
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            EnvFilter::builder()
+                .with_default_directive("ddcp=info".parse().unwrap())
+                .from_env_lossy(),
+        )
+        .init();
+
+    match run().await {
+        Ok(()) => {}
+        Err(e) => error!("{:?}", e),
+    }
 }
 
 async fn run() -> Result<()> {
@@ -28,12 +43,12 @@ async fn run() -> Result<()> {
     let result = match cli.commands {
         Commands::Init => {
             let addr = app.init().await?;
-            println!("{}", addr);
+            info!("{}", addr);
             Ok(())
         }
         Commands::Push => {
             let (addr, _site_id, version) = app.push().await?;
-            println!("{} at version {}", addr, version);
+            info!("{} at version {}", addr, version);
             Ok(())
         }
         Commands::Remote(RemoteArgs {
@@ -47,7 +62,7 @@ async fn run() -> Result<()> {
         }) => {
             let remotes = app.remotes().await?;
             for remote in remotes.iter() {
-                println!("{}\t{}", remote.0, remote.1);
+                info!("{}\t{}", remote.0, remote.1);
             }
             Ok(())
         }

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use flume::Receiver;
+use tracing::{debug, warn};
 use veilid_core::{
     CryptoKind, DHTRecordDescriptor, DHTSchema, KeyPair, OperationId, RouteId, RoutingContext,
     Target, TypedKey, ValueData, ValueSubkey, VeilidAPIResult, VeilidUpdate,
@@ -103,7 +104,7 @@ impl Node for VeilidNode {
             let res = self.updates.recv_async().await;
             match res {
                 Ok(VeilidUpdate::Attachment(attachment)) => {
-                    eprintln!("{:?}", attachment);
+                    debug!("{:?}", attachment);
                     if attachment.public_internet_ready {
                         return Ok(());
                     }
@@ -112,7 +113,7 @@ impl Node for VeilidNode {
                 Ok(VeilidUpdate::Log(_)) => {}
                 Ok(VeilidUpdate::Network(_)) => {}
                 Ok(u) => {
-                    eprintln!("{:?}", u);
+                    debug!("{:?}", u);
                 }
                 Err(e) => {
                     return Err(Error::Other(e.to_string()));
@@ -133,7 +134,7 @@ impl Node for VeilidNode {
         // Attempt to close DHT record in local store.
         if let Some(dht) = maybe_dht {
             if let Err(e) = self.close_dht_record(dht.key().to_owned()).await {
-                eprintln!("failed to close DHT record: {:?}", e);
+                warn!("failed to close DHT record: {:?}", e);
             }
         }
 

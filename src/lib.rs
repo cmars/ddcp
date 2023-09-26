@@ -4,6 +4,7 @@ use flume::{unbounded, Receiver, Sender};
 use rusqlite::{params, types::Value, OptionalExtension};
 use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
+use tracing::{debug, info, instrument, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
     Sequencing, Target, ValueSubkey, VeilidUpdate,
@@ -105,26 +106,27 @@ impl DDCP {
         Ok(VeilidNode::new(routing_context, updates))
     }
 
+    #[instrument(skip(self), level = Level::INFO)]
     pub async fn wait_for_network(&self) -> Result<()> {
         self.node.wait_for_network().await
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn init(&mut self) -> Result<String> {
         // Load or create DHT key
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
-        // TODO: move console output to main
-        println!("{}", addr);
+        info!("{}", addr);
         self.dht_keypair = Some(local_dht);
         Ok(addr)
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn push(&mut self) -> Result<(String, Vec<u8>, i64)> {
         // Load or create DHT key
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
-        // TODO: move console output to main
-        println!("{}", addr);
+        info!("{}", addr);
         self.dht_keypair = Some(local_dht.clone());
 
         let key = local_dht.key().to_owned();
@@ -142,6 +144,7 @@ impl DDCP {
         Ok((addr, site_id, db_version))
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn pull(&mut self, name: &str) -> Result<(bool, i64)> {
         // Get latest status from DHT
         let (site_id, db_version, route_blob) = self.remote_status(name).await?;
@@ -163,8 +166,7 @@ where site_id = ? and event = ?",
         {
             Some(Some(tracked_version)) => {
                 if db_version <= tracked_version {
-                    // TODO: Move CLI output to main
-                    eprintln!("remote {} is up to date", name);
+                    info!("remote {} is up to date", name);
                     return Ok((false, db_version));
                 }
                 tracked_version
@@ -191,6 +193,7 @@ where site_id = ? and event = ?",
         Ok((true, tracked_version))
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub(crate) async fn merge(
         &mut self,
         site_id: Vec<u8>,
@@ -222,7 +225,7 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                         changes[i].cl,
                         changes[i].seq,
                     ])?;
-                    eprintln!("merge change {} {:?} {:?}", n, changes[i], site_id);
+                    debug!("merge change {} {:?} {:?}", n, changes[i], site_id);
                 }
                 tx.execute(
                     "
@@ -244,6 +247,7 @@ on conflict do update set version = max(version, excluded.version)",
         Ok(result)
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub(crate) async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
         let (prior_dht_key, prior_site_id) = self.node.store().load_remote(name).await?;
         let dht = match prior_dht_key {
@@ -286,6 +290,7 @@ on conflict do update set version = max(version, excluded.version)",
         })
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub(crate) async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match self.node.store().load_local_keypair(name).await? {
             Some((key, owner)) => self.node.open_dht_record(key, Some(owner)).await?,
@@ -316,6 +321,7 @@ on conflict do update set version = max(version, excluded.version)",
         Ok(dht)
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn cleanup(self) -> Result<()> {
         // Shut down Veilid node
         self.node.shutdown(self.dht_keypair).await?;
@@ -327,27 +333,31 @@ on conflict do update set version = max(version, excluded.version)",
                 Ok(())
             })
             .await?;
-        eprintln!("crsql_finalized");
+        debug!("crsql_finalized");
 
         Ok(())
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
         let key = CryptoTyped::from_str(addr.as_str())?;
         self.node.store().store_remote_key(&name, &key).await?;
         Ok(())
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn remote_remove(&self, name: String) -> Result<()> {
         self.node.store().remove_remote(name).await?;
         Ok(())
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
         let result = self.node.store().remotes().await?;
         Ok(result)
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn serve(&mut self) -> Result<()> {
         // Create a private route and publish it
         let (route_id, route_blob) = self.node.new_private_route().await?;
@@ -360,7 +370,7 @@ on conflict do update set version = max(version, excluded.version)",
         let (stop_sender, stop_receiver) = oneshot::channel::<()>();
         let tracker_handle = self.local_tracker(stop_receiver, local_dht.clone()).await?;
 
-        println!("{}", local_dht.key().to_string());
+        info!("{}", local_dht.key().to_string());
 
         // Handle requests from peers
         loop {
@@ -372,7 +382,7 @@ on conflict do update set version = max(version, excluded.version)",
                     }
                 }
                 _ = signal::ctrl_c() => {
-                    eprintln!("interrupt received");
+                    warn!("interrupt received");
                     stop_sender.send(()).map_err(|e| other_err(format!("{:?}", e)))?;
                     break
                 }
@@ -383,6 +393,7 @@ on conflict do update set version = max(version, excluded.version)",
         Ok(())
     }
 
+    #[instrument(skip(self), level = Level::DEBUG)]
     pub(crate) async fn handle_update(&mut self, update: VeilidUpdate) -> Result<()> {
         match update {
             // TODO: handle routing changes
@@ -391,7 +402,7 @@ on conflict do update set version = max(version, excluded.version)",
                 let request = match proto::decode_request_message(app_call.message()) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("invalid request: {:?}", e);
+                        warn!("invalid request: {:?}", e);
                         return Ok(());
                     }
                 };
@@ -422,6 +433,7 @@ on conflict do update set version = max(version, excluded.version)",
     }
 
     /// Poll local db for changes in latest db version, update DHT.
+    #[instrument(skip(self), level = Level::DEBUG)]
     async fn local_tracker(
         &self,
         mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
@@ -446,6 +458,7 @@ on conflict do update set version = max(version, excluded.version)",
                         node
                             .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
                             .await?;
+                        debug!(db_version, key = key.to_string(), "updated DHT");
                         prev_db_version = db_version;
                     }
                     _ = &mut stop_receiver => {
@@ -459,6 +472,7 @@ on conflict do update set version = max(version, excluded.version)",
     }
 }
 
+#[instrument(skip(conn), level = Level::DEBUG)]
 pub async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
     let (site_id, db_version) = conn
         .call(|c| {
@@ -473,6 +487,7 @@ select crsql_site_id(), crsql_db_version();",
     Ok((site_id, db_version))
 }
 
+#[instrument(skip(conn), level = Level::DEBUG)]
 pub async fn changes(
     conn: &Connection,
     since_db_version: i64,
