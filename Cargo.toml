@@ -29,6 +29,3 @@ xdg = "2.5.2"
 
 [build-dependencies]
 capnpc = "0.18.0"
-
-[dev-dependencies]
-tempdir = "0.3.7"

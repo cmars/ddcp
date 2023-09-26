@@ -2,26 +2,27 @@ use async_trait::async_trait;
 
 use flume::Receiver;
 use veilid_core::{
-    DHTRecordDescriptor, KeyPair, OperationId, RouteId, RoutingContext, Target, TypedKey,
-    ValueData, ValueSubkey, VeilidAPI, VeilidAPIResult, VeilidUpdate, DHTSchema, CryptoKind,
+    CryptoKind, DHTRecordDescriptor, DHTSchema, KeyPair, OperationId, RouteId, RoutingContext,
+    Target, TypedKey, ValueData, ValueSubkey, VeilidAPIResult, VeilidUpdate,
 };
 
 use crate::{
     error::{Error, Result},
     other_err,
+    store::{Store, VeilidStore},
 };
 
 #[async_trait]
 pub trait Node: Send + Sync {
     fn clone_box(&self) -> Box<dyn Node>;
 
-    fn api(&self) -> VeilidAPI;
+    fn store(&self) -> &dyn Store;
 
     async fn wait_for_network(&self) -> Result<()>;
 
-    async fn recv_updates_async(&self) -> Result<VeilidUpdate>;
+    async fn shutdown(&self, maybe_dht: Option<DHTRecordDescriptor>) -> VeilidAPIResult<()>;
 
-    async fn shutdown(&self) -> VeilidAPIResult<()>;
+    async fn recv_updates_async(&self) -> Result<VeilidUpdate>;
 
     // AppCall operations
 
@@ -59,7 +60,7 @@ pub trait Node: Send + Sync {
         force_refresh: bool,
     ) -> VeilidAPIResult<Option<ValueData>>;
     async fn set_dht_value(
-        &self,
+        &mut self,
         key: TypedKey,
         subkey: ValueSubkey,
         data: Vec<u8>,
@@ -67,6 +68,7 @@ pub trait Node: Send + Sync {
 }
 
 pub struct VeilidNode {
+    table_store: Box<dyn Store>,
     routing_context: RoutingContext,
     updates: Receiver<VeilidUpdate>,
 }
@@ -74,6 +76,7 @@ pub struct VeilidNode {
 impl VeilidNode {
     pub fn new(routing_context: RoutingContext, updates: Receiver<VeilidUpdate>) -> Box<dyn Node> {
         Box::new(VeilidNode {
+            table_store: VeilidStore::new(routing_context.api()),
             routing_context,
             updates,
         })
@@ -84,13 +87,14 @@ impl VeilidNode {
 impl Node for VeilidNode {
     fn clone_box(&self) -> Box<dyn Node> {
         Box::new(VeilidNode {
+            table_store: self.table_store.clone_box(),
             routing_context: self.routing_context.clone(),
             updates: self.updates.clone(),
         })
     }
 
-    fn api(&self) -> VeilidAPI {
-        self.routing_context.api()
+    fn store(&self) -> &dyn Store {
+        self.table_store.as_ref()
     }
 
     async fn wait_for_network(&self) -> Result<()> {
@@ -121,9 +125,17 @@ impl Node for VeilidNode {
         self.updates.recv_async().await.map_err(other_err)
     }
 
-    async fn shutdown(&self) -> VeilidAPIResult<()> {
-        self.api().detach().await?;
-        self.api().shutdown().await;
+    async fn shutdown(&self, maybe_dht: Option<DHTRecordDescriptor>) -> VeilidAPIResult<()> {
+        self.table_store.upgrade().await?;
+
+        // Attempt to close DHT record
+        if let Some(dht) = maybe_dht {
+            if let Err(e) = self.close_dht_record(dht.key().to_owned()).await {
+                eprintln!("failed to close DHT record: {:?}", e);
+            }
+        }
+        self.routing_context.api().detach().await?;
+        self.routing_context.api().shutdown().await;
         Ok(())
     }
 
@@ -186,7 +198,7 @@ impl Node for VeilidNode {
     }
 
     async fn set_dht_value(
-        &self,
+        &mut self,
         key: TypedKey,
         subkey: ValueSubkey,
         data: Vec<u8>,

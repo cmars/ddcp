@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, types::Value, OptionalExtension};
 use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
 use veilid_core::{
@@ -19,13 +19,6 @@ pub mod veilid_config;
 pub use error::{other_err, Error, Result};
 pub use node::{Node, VeilidNode};
 use proto::{Request, Response};
-use store::{
-    load_local_keypair, load_remote, store_local_keypair, store_remote_key, store_remote_site_id,
-};
-
-use crate::store::{
-    TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS, TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS,
-};
 
 pub struct DDCP {
     conn: Connection,
@@ -33,17 +26,16 @@ pub struct DDCP {
     dht_keypair: Option<DHTRecordDescriptor>,
 }
 
-const LOCAL_KEYPAIR_NAME: &'static str = "__local";
+pub(crate) const LOCAL_KEYPAIR_NAME: &'static str = "__local";
 
-const SUBKEY_SITE_ID: ValueSubkey = 0;
-const SUBKEY_DB_VERSION: ValueSubkey = 1;
-const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
+pub(crate) const DHT_SUBKEY_COUNT: u16 = 3;
+pub(crate) const SUBKEY_SITE_ID: ValueSubkey = 0;
+pub(crate) const SUBKEY_DB_VERSION: ValueSubkey = 1;
+pub(crate) const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
 
-const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
+pub(crate) const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
 
-const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
-//const CRSQL_TRACKED_EVENT_SEND: i32 = 1;
-const CRSQL_TRACKED_EVENT_DDCP_MERGE: i32 = 1000;
+pub(crate) const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
 
 impl DDCP {
     pub async fn new(db_path: Option<&str>, state_path: &str, ext_path: &str) -> Result<DDCP> {
@@ -56,7 +48,8 @@ impl DDCP {
         })
     }
 
-    pub fn new_conn_node(conn: Connection, node: Box<dyn Node>) -> DDCP {
+    #[cfg(test)]
+    pub(crate) fn new_conn_node(conn: Connection, node: Box<dyn Node>) -> DDCP {
         DDCP {
             conn,
             node,
@@ -64,7 +57,7 @@ impl DDCP {
         }
     }
 
-    pub async fn new_connection(
+    pub(crate) async fn new_connection(
         db_path: Option<&str>,
         ext_path: &str,
     ) -> Result<Connection> {
@@ -131,25 +124,6 @@ impl DDCP {
 
     async fn init_db(&self) -> Result<()> {
         // TODO: good place to run schema migrations
-        self.conn
-            .call(|conn| {
-                conn.execute(
-                    "
-                    create table if not exists ddcp_remote_changes (
-                        \"table\" text not null,
-                        pk text not null,
-                        cid text not null,
-                        val any,
-                        col_version integer not null,
-                        db_version integer not null,
-                        site_id blob not null,
-                        cl integer not null,
-                        seq integer not null);
-                    ",
-                    [],
-                )
-            })
-            .await?;
         Ok(())
     }
 
@@ -176,7 +150,7 @@ impl DDCP {
         Ok((addr, site_id, db_version))
     }
 
-    pub async fn fetch(&mut self, name: &str) -> Result<(bool, i64)> {
+    pub async fn pull(&mut self, name: &str) -> Result<(bool, i64)> {
         // Get latest status from DHT
         let (site_id, db_version, route_blob) = self.remote_status(name).await?;
 
@@ -186,8 +160,8 @@ impl DDCP {
             .call(move |conn| {
                 conn.query_row(
                     "
-select max(version) from crsql_tracked_peers
-where site_id = ? and event = ? and version is not null",
+select max(coalesce(version, -1)) from crsql_tracked_peers
+where site_id = ? and event = ?",
                     params![site_id, CRSQL_TRACKED_EVENT_RECEIVE],
                     |row| row.get::<usize, Option<i64>>(0),
                 )
@@ -219,14 +193,64 @@ where site_id = ? and event = ? and version is not null",
         let resp = proto::decode_response_message(msg_bytes.as_slice())?;
 
         if let Response::Changes { site_id, changes } = resp {
-            self.stage(site_id, changes).await?;
+            self.merge(site_id, changes).await?;
         }
 
         Ok((true, tracked_version))
     }
 
-    async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
-        let (prior_dht_key, prior_site_id) = load_remote(self.node.api(), name).await?;
+    pub(crate) async fn merge(
+        &mut self,
+        site_id: Vec<u8>,
+        changes: Vec<proto::Change>,
+    ) -> Result<i64> {
+        let result = self
+            .conn
+            .call(move |conn| {
+                let mut max_db_version = -1;
+                for i in 0..changes.len() {
+                    if changes[i].db_version > max_db_version {
+                        max_db_version = changes[i].db_version;
+                    }
+                    let n = conn.execute(
+                        "
+insert into crsql_changes (
+    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                        params![
+                            changes[i].table,
+                            changes[i].pk,
+                            changes[i].cid,
+                            changes[i].val,
+                            changes[i].col_version,
+                            changes[i].db_version,
+                            &site_id,
+                            changes[i].cl,
+                            changes[i].seq,
+                        ],
+                    )?;
+                    eprintln!("merge change {} {:?} {:?}", n, changes[i], site_id);
+                }
+                conn.execute(
+                    "
+insert into crsql_tracked_peers (site_id, version, tag, event)
+values (?, ?, ?, ?)
+on conflict do update set version = max(version, excluded.version)",
+                    params![
+                        site_id,
+                        max_db_version,
+                        CRSQL_TRACKED_TAG_WHOLE_DATABASE,
+                        CRSQL_TRACKED_EVENT_RECEIVE
+                    ],
+                )?;
+                Ok(max_db_version)
+            })
+            .await?;
+        Ok(result)
+    }
+
+    pub(crate) async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
+        let (prior_dht_key, prior_site_id) = self.node.store().load_remote(name).await?;
         let dht = match prior_dht_key {
             Some(key) => self.node.open_dht_record(key, None).await?,
             None => return Err(other_err(format!("remote {} not found", name))),
@@ -246,7 +270,10 @@ where site_id = ? and event = ? and version is not null",
 
         match (prior_site_id, &maybe_site_id) {
             (None, Some(site_id)) => {
-                store_remote_site_id(self.node.api(), name, site_id.data().to_owned()).await?;
+                self.node
+                    .store()
+                    .store_remote_site_id(name, site_id.data().to_owned())
+                    .await?;
             }
             _ => {}
         };
@@ -264,139 +291,100 @@ where site_id = ? and event = ? and version is not null",
         })
     }
 
-    async fn stage(&mut self, site_id: Vec<u8>, changes: Vec<proto::Change>) -> Result<i64> {
-        let result = self
-            .conn
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                let mut max_db_version = -1;
-                let mut stmt = tx.prepare(
-                    "
-insert into ddcp_remote_changes (
-    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
-)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                )?;
-                for change in changes.iter() {
-                    if change.db_version > max_db_version {
-                        max_db_version = change.db_version;
-                    }
-                    stmt.execute(params![
-                        &change.table,
-                        &change.pk,
-                        &change.cid,
-                        &change.val,
-                        &change.col_version,
-                        &change.db_version,
-                        &site_id,
-                        &change.cl,
-                        &change.seq,
-                    ])?;
-                }
-                tx.execute(
-                    "
-insert into crsql_tracked_peers (site_id, version, tag, event)
-values (?, ?, ?, ?)
-on conflict do update set version = excluded.version",
-                    params![
-                        site_id,
-                        max_db_version,
-                        CRSQL_TRACKED_TAG_WHOLE_DATABASE,
-                        CRSQL_TRACKED_EVENT_RECEIVE
-                    ],
-                )?;
-                drop(stmt);
-                tx.commit()?;
-                Ok(max_db_version)
-            })
-            .await?;
-        Ok(result)
-    }
-
-    pub async fn merge(&mut self, name: &str) -> Result<()> {
-        let site_id = if let (Some(_), Some(site_id)) = load_remote(self.node.api(), name).await? {
-            site_id
-        } else {
-            return Err(other_err(format!(
-                "cannot merge from {}; no site_id: try fetching first",
-                name
-            )));
-        };
-        self.conn
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                let max_db_version = match tx
-                    .query_row(
+    /*
+        pub async fn merge(&mut self, name: &str) -> Result<()> {
+            let site_id = if let (Some(_), Some(site_id)) = self.node.store().load_remote(name).await? {
+                site_id
+            } else {
+                return Err(other_err(format!(
+                    "cannot merge from {}; no site_id: try fetching first",
+                    name
+                )));
+            };
+            self.conn
+                .call(move |conn| {
+                    let tx = conn.transaction()?;
+                    let max_db_version = match tx
+                        .query_row(
+                            "
+    select cast(max(version) as integer) as max_version from crsql_tracked_peers
+    where site_id = ? and tag = ? and event = ?",
+                            params![
+                                site_id,
+                                CRSQL_TRACKED_TAG_WHOLE_DATABASE,
+                                CRSQL_TRACKED_EVENT_DDCP_MERGE
+                            ],
+                            |row| row.get::<usize, Option<i64>>(0),
+                        )
+                        .optional()?
+                    {
+                        Some(Some(version)) => version,
+                        _ => -1,
+                    };
+                    let nrows = tx.execute(
                         "
-select cast(max(version) as integer) as max_version from crsql_tracked_peers
-where site_id = ? and tag = ? and event = ?",
-                        params![
-                            site_id,
-                            CRSQL_TRACKED_TAG_WHOLE_DATABASE,
-                            CRSQL_TRACKED_EVENT_DDCP_MERGE
-                        ],
-                        |row| row.get::<usize, Option<i64>>(0),
-                    )
-                    .optional()?
-                {
-                    Some(Some(version)) => version,
-                    _ => -1,
-                };
-                tx.execute(
-                    "
-insert into crsql_changes (
-    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
-select
-    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
-from ddcp_remote_changes
-where site_id = ?
-and db_version > ?",
-                    params![site_id, max_db_version],
-                )?;
-                tx.execute(
-                    "
-insert into crsql_tracked_peers (
-    site_id, version, tag, event)
-select site_id, max(db_version), ?, ?
-from ddcp_remote_changes
-where site_id = ?
-order by db_version desc
-limit 1",
-                    params![
-                        CRSQL_TRACKED_TAG_WHOLE_DATABASE,
-                        CRSQL_TRACKED_EVENT_DDCP_MERGE,
-                        site_id
-                    ],
-                )?;
-                tx.commit()
-            })
-            .await?;
-        Ok(())
-    }
+    insert into crsql_changes (
+        \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
+    select
+        \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
+    from ddcp_remote_changes
+    where site_id = ?
+    and db_version > ?",
+                        params![site_id, max_db_version],
+                    )?;
+                    if nrows > 0 {
+                        tx.execute(
+                            "
+    insert into crsql_tracked_peers (
+        site_id, version, tag, event)
+    select ?1, max(db_version), ?2, ?3
+    from ddcp_remote_changes
+    where site_id = ?1
+    order by db_version desc
+    limit 1",
+                            params![
+                                site_id,
+                                CRSQL_TRACKED_TAG_WHOLE_DATABASE,
+                                CRSQL_TRACKED_EVENT_DDCP_MERGE,
+                            ],
+                        )?;
+                    }
+                    tx.commit()
+                })
+                .await?;
+            Ok(())
+        }
 
-    pub async fn pull(&mut self, name: &str) -> Result<()> {
-        self.fetch(name).await?;
-        self.merge(name).await
-    }
+        pub async fn pull(&mut self, name: &str) -> Result<()> {
+            self.fetch(name).await?;
+            self.merge(name).await
+        }
+        */
 
-    async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
-        let dht = match load_local_keypair(self.node.api(), name).await? {
+    pub(crate) async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
+        let dht = match self.node.store().load_local_keypair(name).await? {
             Some((key, owner)) => self.node.open_dht_record(key, Some(owner)).await?,
             None => {
                 let new_dht = self
                     .node
-                    .create_dht_record(DHTSchema::DFLT(DHTSchemaDFLT { o_cnt: 3 }), None)
+                    .create_dht_record(
+                        DHTSchema::DFLT(DHTSchemaDFLT {
+                            o_cnt: DHT_SUBKEY_COUNT,
+                        }),
+                        None,
+                    )
                     .await?;
-                store_local_keypair(
-                    self.node.api(),
-                    name,
-                    new_dht.key(),
-                    KeyPair::new(
-                        new_dht.owner().to_owned(),
-                        new_dht.owner_secret().unwrap().to_owned(),
-                    ),
-                )
-                .await?;
+                self.node
+                    .store()
+                    .store_local_keypair(
+                        name,
+                        new_dht.key(),
+                        KeyPair::new(
+                            new_dht.owner().to_owned(),
+                            new_dht.owner_secret().unwrap().to_owned(),
+                        ),
+                    )
+                    .await?;
                 new_dht
             }
         };
@@ -404,29 +392,8 @@ limit 1",
     }
 
     pub async fn cleanup(self) -> Result<()> {
-        // Upgrade columns if necessary
-        let _ = self
-            .node
-            .api()
-            .table_store()?
-            .open(TABLE_STORE_LOCAL, TABLE_STORE_LOCAL_COLUMNS)
-            .await?;
-        let _ = self
-            .node
-            .api()
-            .table_store()?
-            .open(TABLE_STORE_REMOTE, TABLE_STORE_REMOTE_COLUMNS)
-            .await?;
-
-        // Attempt to close DHT record
-        if let Some(local_dht) = self.dht_keypair {
-            if let Err(e) = self.node.close_dht_record(local_dht.key().to_owned()).await {
-                eprintln!("failed to close DHT record: {:?}", e);
-            }
-        }
-
         // Shut down Veilid node
-        self.node.shutdown().await?;
+        self.node.shutdown(self.dht_keypair).await?;
 
         // Finalize cr-sqlite db
         self.conn
@@ -442,26 +409,17 @@ limit 1",
 
     pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
         let key = CryptoTyped::from_str(addr.as_str())?;
-        store_remote_key(self.node.api(), &name, &key).await?;
+        self.node.store().store_remote_key(&name, &key).await?;
         Ok(())
     }
 
     pub async fn remote_remove(&self, name: String) -> Result<()> {
-        let db = self.node.api().table_store()?.open("remote", 1).await?;
-        db.delete(0, name.as_bytes()).await?;
+        self.node.store().remove_remote(name).await?;
         Ok(())
     }
 
     pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
-        let db = self.node.api().table_store()?.open("remote", 1).await?;
-        let keys = db.get_keys(0).await?;
-        let mut result = vec![];
-        for db_key in keys.iter() {
-            let name = std::str::from_utf8(db_key.as_slice())?.to_owned();
-            if let (Some(remote_key), _) = load_remote(self.node.api(), name.as_str()).await? {
-                result.push((name, remote_key));
-            }
-        }
+        let result = self.node.store().remotes().await?;
         Ok(result)
     }
 
@@ -543,7 +501,7 @@ limit 1",
         local_dht: DHTRecordDescriptor,
     ) -> Result<JoinHandle<Result<()>>> {
         let conn = self.conn.clone();
-        let node = self.node.clone_box();
+        let mut node = self.node.clone_box();
         let key = local_dht.key().to_owned();
         let mut timer = tokio::time::interval(Duration::from_secs(60));
 
@@ -574,7 +532,7 @@ limit 1",
     }
 }
 
-async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
+pub(crate) async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
     let (site_id, db_version) = conn
         .call(|c| {
             c.query_row(
@@ -588,7 +546,7 @@ select crsql_site_id(), crsql_db_version();",
     Ok((site_id, db_version))
 }
 
-async fn changes(
+pub(crate) async fn changes(
     conn: &Connection,
     since_db_version: i64,
 ) -> Result<(Vec<u8>, Vec<proto::Change>)> {
@@ -604,7 +562,7 @@ select
     \"table\",
     pk,
     cid,
-    cast(val as blob) as val,
+    val,
     col_version,
     db_version,
     cl,
@@ -613,32 +571,26 @@ from crsql_changes
 where db_version > ?
 and site_id is null",
             )?;
-            let changes_iter = stmt.query_map([since_db_version], |row| {
-                Ok(proto::Change {
+            let mut result = vec![];
+            let mut rows = stmt.query([since_db_version])?;
+            while let Some(row) = rows.next()? {
+                let change = proto::Change {
                     table: row.get::<usize, String>(0)?,
                     pk: row.get::<usize, Vec<u8>>(1)?,
                     cid: row.get::<usize, String>(2)?,
-                    val: match row.get::<usize, Option<Vec<u8>>>(3)? {
-                        Some(val) => val,
-                        None => vec![],
-                    },
+                    val: row.get::<usize, Value>(3)?,
                     col_version: row.get::<usize, i64>(4)?,
                     db_version: row.get::<usize, i64>(5)?,
                     cl: row.get::<usize, i64>(6)?,
                     seq: row.get::<usize, i64>(7)?,
-                })
-            })?;
-            changes_iter.fold(Ok(vec![]), |acc, x| match acc {
-                Ok(mut changes) => match x {
-                    Ok(change) => {
-                        changes.push(change);
-                        Ok(changes)
-                    }
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            })
+                };
+                result.push(change);
+            }
+            Ok(result)
         })
         .await?;
     Ok((site_id, changes))
 }
+
+#[cfg(test)]
+mod tests;

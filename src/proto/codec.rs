@@ -1,9 +1,15 @@
+use std::str::Utf8Error;
+
 use capnp::{
     message::{self, ReaderOptions},
     serialize,
 };
+use rusqlite::types::Value;
 
-use super::{ddcp_capnp::request, ddcp_capnp::response};
+use super::{
+    ddcp_capnp::request,
+    ddcp_capnp::{change_value, response},
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -22,7 +28,7 @@ pub enum Request {
     Changes { since_db_version: i64 },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Response {
     Status {
         site_id: Vec<u8>,
@@ -34,12 +40,12 @@ pub enum Response {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Change {
     pub table: String,
     pub pk: Vec<u8>,
     pub cid: String,
-    pub val: Vec<u8>,
+    pub val: Value,
     pub col_version: i64,
     pub db_version: i64,
     pub cl: i64,
@@ -105,11 +111,18 @@ pub fn encode_response(response: Response, builder: &mut response::Builder) -> R
                 build_change.set_table(changes[i].table.as_str().into());
                 build_change.set_pk(changes[i].pk.as_slice());
                 build_change.set_cid(changes[i].cid.as_str().into());
-                build_change.set_val(changes[i].val.as_slice());
                 build_change.set_col_version(changes[i].col_version);
                 build_change.set_db_version(changes[i].db_version);
                 build_change.set_cl(changes[i].cl);
                 build_change.set_seq(changes[i].seq);
+                let mut val_change = build_change.reborrow().init_val();
+                match &changes[i].val {
+                    Value::Null => val_change.set_null(()),
+                    Value::Integer(i) => val_change.set_integer(*i),
+                    Value::Real(r) => val_change.set_real(*r),
+                    Value::Text(t) => val_change.set_text(t.as_str().into()),
+                    Value::Blob(b) => val_change.set_blob(b),
+                };
             }
         }
         Response::Status {
@@ -140,7 +153,15 @@ pub fn decode_response(reader: &response::Reader) -> Result<Response> {
                     table: change.get_table()?.to_string()?,
                     pk: change.get_pk()?.to_vec(),
                     cid: change.get_cid()?.to_string()?,
-                    val: change.get_val()?.to_vec(),
+                    val: match change.get_val()?.which()? {
+                        change_value::Which::Null(_) => Value::Null,
+                        change_value::Which::Integer(i) => Value::Integer(i),
+                        change_value::Which::Real(r) => Value::Real(r),
+                        change_value::Which::Text(t) => {
+                            Value::Text(t?.to_string().map_err(|e| Utf8Error::from(e))?)
+                        }
+                        change_value::Which::Blob(b) => Value::Blob(b?.to_vec()),
+                    },
                     col_version: change.get_col_version(),
                     db_version: change.get_db_version(),
                     cl: change.get_cl(),
@@ -223,7 +244,7 @@ mod tests {
                 table: "some_table".to_owned(),
                 pk: "some_pk".to_string().into_bytes(),
                 cid: "el_cid".to_owned(),
-                val: vec![0xa5u8, 8],
+                val: rusqlite::types::Value::Integer(42),
                 col_version: 23,
                 db_version: 42,
                 cl: 99,
@@ -233,7 +254,7 @@ mod tests {
                 table: "some_other_table".to_owned(),
                 pk: "some_other_pk".to_string().into_bytes(),
                 cid: "a_cid".to_owned(),
-                val: vec![0x5au8, 8],
+                val: rusqlite::types::Value::Text("foo".to_string()),
                 col_version: 32,
                 db_version: 24,
                 cl: 111,
