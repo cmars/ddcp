@@ -211,19 +211,17 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                     if changes[i].db_version > max_db_version {
                         max_db_version = changes[i].db_version;
                     }
-                    let n = ins_changes.execute(
-                        params![
-                            changes[i].table,
-                            changes[i].pk,
-                            changes[i].cid,
-                            changes[i].val,
-                            changes[i].col_version,
-                            changes[i].db_version,
-                            &site_id,
-                            changes[i].cl,
-                            changes[i].seq,
-                        ],
-                    )?;
+                    let n = ins_changes.execute(params![
+                        changes[i].table,
+                        changes[i].pk,
+                        changes[i].cid,
+                        changes[i].val,
+                        changes[i].col_version,
+                        changes[i].db_version,
+                        &site_id,
+                        changes[i].cl,
+                        changes[i].seq,
+                    ])?;
                     eprintln!("merge change {} {:?} {:?}", n, changes[i], site_id);
                 }
                 tx.execute(
@@ -387,6 +385,8 @@ on conflict do update set version = max(version, excluded.version)",
 
     pub(crate) async fn handle_update(&mut self, update: VeilidUpdate) -> Result<()> {
         match update {
+            // TODO: handle routing changes
+            // TODO: handle connectivity changes (re-announce DHT on re-connect)
             VeilidUpdate::AppCall(app_call) => {
                 let request = match proto::decode_request_message(app_call.message()) {
                     Ok(r) => r,
@@ -396,8 +396,8 @@ on conflict do update set version = max(version, excluded.version)",
                     }
                 };
                 match request {
+                    // TODO: spawn responder to unblock event loop
                     Request::Status => {
-                        // TODO: spawn responder to unblock event loop
                         let (site_id, db_version) = status(&self.conn).await?;
                         let resp = proto::encode_response_message(Response::Status {
                             site_id,
@@ -459,7 +459,7 @@ on conflict do update set version = max(version, excluded.version)",
     }
 }
 
-pub(crate) async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
+pub async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
     let (site_id, db_version) = conn
         .call(|c| {
             c.query_row(
@@ -473,7 +473,7 @@ select crsql_site_id(), crsql_db_version();",
     Ok((site_id, db_version))
 }
 
-pub(crate) async fn changes(
+pub async fn changes(
     conn: &Connection,
     since_db_version: i64,
 ) -> Result<(Vec<u8>, Vec<proto::Change>)> {

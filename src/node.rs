@@ -126,14 +126,18 @@ impl Node for VeilidNode {
     }
 
     async fn shutdown(&self, maybe_dht: Option<DHTRecordDescriptor>) -> VeilidAPIResult<()> {
+        // Upgrade table store columns. Idempotent, expands columns if a new
+        // release adds a column.
         self.table_store.upgrade().await?;
 
-        // Attempt to close DHT record
+        // Attempt to close DHT record in local store.
         if let Some(dht) = maybe_dht {
             if let Err(e) = self.close_dht_record(dht.key().to_owned()).await {
                 eprintln!("failed to close DHT record: {:?}", e);
             }
         }
+
+        // Graceful shutdown of Veilid node.
         self.routing_context.api().detach().await?;
         self.routing_context.api().shutdown().await;
         Ok(())
