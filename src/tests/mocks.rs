@@ -9,7 +9,7 @@ use veilid_core::{
     CRYPTO_KIND_VLD0,
 };
 
-use crate::{other_err, store::Store, Node, Result, DDCP, DHT_SUBKEY_COUNT};
+use crate::{other_err, store::Store, Node, Result, DDCP, DHT_SUBKEY_COUNT, SUBKEY_SITE_ID, SUBKEY_DB_VERSION};
 
 pub async fn setup() -> (DDCP, Connection, MockStore) {
     let conn = DDCP::new_connection(None, "target/debug/crsqlite")

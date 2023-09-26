@@ -1,10 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{params, types::Value, OptionalExtension};
 use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
-use tracing::{debug, info, instrument, warn, Level};
+use tracing::{debug, error, info, instrument, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
     Sequencing, Target, ValueSubkey, VeilidUpdate,
@@ -48,7 +49,6 @@ impl DDCP {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn new_conn_node(conn: Connection, node: Box<dyn Node>) -> DDCP {
         DDCP {
             conn,
@@ -147,7 +147,7 @@ impl DDCP {
     #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn pull(&mut self, name: &str) -> Result<(bool, i64)> {
         // Get latest status from DHT
-        let (site_id, db_version, route_blob) = self.remote_status(name).await?;
+        let (site_id, db_version, route_blob) = remote_status(self.node.clone_box(), name).await?;
 
         // Do we need to fetch newer versions?
         let tracked_version = match self
@@ -248,49 +248,6 @@ on conflict do update set version = max(version, excluded.version)",
     }
 
     #[instrument(skip(self), level = Level::DEBUG)]
-    pub(crate) async fn remote_status(&mut self, name: &str) -> Result<(Vec<u8>, i64, Vec<u8>)> {
-        let (prior_dht_key, prior_site_id) = self.node.store().load_remote(name).await?;
-        let dht = match prior_dht_key {
-            Some(key) => self.node.open_dht_record(key, None).await?,
-            None => return Err(other_err(format!("remote {} not found", name))),
-        };
-        let maybe_site_id = self
-            .node
-            .get_dht_value(dht.key().to_owned(), SUBKEY_SITE_ID, true)
-            .await?;
-        let maybe_db_version = self
-            .node
-            .get_dht_value(dht.key().to_owned(), SUBKEY_DB_VERSION, true)
-            .await?;
-        let maybe_route_blob = self
-            .node
-            .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
-            .await?;
-
-        match (prior_site_id, &maybe_site_id) {
-            (None, Some(site_id)) => {
-                self.node
-                    .store()
-                    .store_remote_site_id(name, site_id.data().to_owned())
-                    .await?;
-            }
-            _ => {}
-        };
-
-        Ok(match (maybe_site_id, maybe_db_version, maybe_route_blob) {
-            (Some(sid), Some(dbv), Some(rt)) => {
-                let dbv_arr: [u8; 8] = dbv.data().try_into().map_err(other_err)?;
-                (
-                    sid.data().to_owned(),
-                    i64::from_be_bytes(dbv_arr),
-                    rt.data().to_owned(),
-                )
-            }
-            _ => return Err(other_err(format!("remote {} not available", name))),
-        })
-    }
-
-    #[instrument(skip(self), level = Level::DEBUG)]
     pub(crate) async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match self.node.store().load_local_keypair(name).await? {
             Some((key, owner)) => self.node.open_dht_record(key, Some(owner)).await?,
@@ -323,6 +280,13 @@ on conflict do update set version = max(version, excluded.version)",
 
     #[instrument(skip(self), level = Level::DEBUG)]
     pub async fn cleanup(self) -> Result<()> {
+        let remotes = self.remotes().await?;
+        for (name, _) in remotes.iter() {
+            if let (Some(remote_dht), _) = self.node.store().load_remote(name).await? {
+                let _ = self.node.close_dht_record(remote_dht).await;
+            }
+        }
+
         // Shut down Veilid node
         self.node.shutdown(self.dht_keypair).await?;
 
@@ -367,8 +331,12 @@ on conflict do update set version = max(version, excluded.version)",
             .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
             .await?;
 
-        let (stop_sender, stop_receiver) = oneshot::channel::<()>();
-        let tracker_handle = self.local_tracker(stop_receiver, local_dht.clone()).await?;
+        let (stop_local_sender, stop_local_receiver) = oneshot::channel::<()>();
+        let local_tracker = self
+            .local_tracker(stop_local_receiver, local_dht.clone())
+            .await?;
+        let (stop_remote_sender, stop_remote_receiver) = oneshot::channel::<()>();
+        let remote_tracker = self.remote_tracker(stop_remote_receiver).await?;
 
         info!("{}", local_dht.key().to_string());
 
@@ -383,13 +351,16 @@ on conflict do update set version = max(version, excluded.version)",
                 }
                 _ = signal::ctrl_c() => {
                     warn!("interrupt received");
-                    stop_sender.send(()).map_err(|e| other_err(format!("{:?}", e)))?;
+                    // TODO: warn on send failures
+                    let _ = stop_local_sender.send(()).map_err(|e| other_err(format!("{:?}", e)));
+                    let _ = stop_remote_sender.send(()).map_err(|e| other_err(format!("{:?}", e)));
                     break
                 }
             }
         }
         self.node.release_private_route(route_id)?;
-        tracker_handle.await.map_err(other_err)??;
+        local_tracker.await.map_err(other_err)??;
+        remote_tracker.await.map_err(other_err)??;
         Ok(())
     }
 
@@ -470,6 +441,89 @@ on conflict do update set version = max(version, excluded.version)",
         });
         Ok(h)
     }
+
+    /// Poll remotes for changes.
+    #[instrument(skip(self), level = Level::DEBUG)]
+    async fn remote_tracker(
+        &self,
+        mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<JoinHandle<Result<()>>> {
+        let mut ddcp = Self::new_conn_node(self.conn.clone(), self.node.clone_box());
+        let mut timer = tokio::time::interval(Duration::from_secs(60));
+
+        let h = tokio::spawn(async move {
+            let remotes = ddcp.remotes().await?;
+            let mut rng: StdRng = SeedableRng::from_entropy();
+            loop {
+                select! {
+                    _ = timer.tick() => {
+                        let remote_index = rng.gen_range(0..remotes.len());
+                        let remote_name = &remotes[remote_index].0;
+                        match ddcp.pull(remote_name).await {
+                            Ok((updated, version)) => {
+                                if updated {
+                                    info!(remote_name, updated, version, "remote_tracker");
+                                } else {
+                                    debug!(remote_name, updated, version, "remote_tracker");
+                                }
+                            }
+                            Err(e) => {
+                                error!("failed to pull from {}: {:?}", remote_name, e);
+                            }
+                        }
+                    }
+                    _ = &mut stop_receiver => {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        });
+        Ok(h)
+    }
+}
+
+#[instrument(skip(node), level = Level::DEBUG)]
+pub(crate) async fn remote_status(
+    node: Box<dyn Node>,
+    name: &str,
+) -> Result<(Vec<u8>, i64, Vec<u8>)> {
+    let (prior_dht_key, prior_site_id) = node.store().load_remote(name).await?;
+    let dht = match prior_dht_key {
+        Some(key) => node.open_dht_record(key, None).await?,
+        None => return Err(other_err(format!("remote {} not found", name))),
+    };
+    let maybe_site_id = node
+        .get_dht_value(dht.key().to_owned(), SUBKEY_SITE_ID, true)
+        .await?;
+    let maybe_db_version = node
+        .get_dht_value(dht.key().to_owned(), SUBKEY_DB_VERSION, true)
+        .await?;
+    let maybe_route_blob = node
+        .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
+        .await?;
+    let _ = node.close_dht_record(dht.key().to_owned()).await?;
+
+    match (prior_site_id, &maybe_site_id) {
+        (None, Some(site_id)) => {
+            node.store()
+                .store_remote_site_id(name, site_id.data().to_owned())
+                .await?;
+        }
+        _ => {}
+    };
+
+    Ok(match (maybe_site_id, maybe_db_version, maybe_route_blob) {
+        (Some(sid), Some(dbv), Some(rt)) => {
+            let dbv_arr: [u8; 8] = dbv.data().try_into().map_err(other_err)?;
+            (
+                sid.data().to_owned(),
+                i64::from_be_bytes(dbv_arr),
+                rt.data().to_owned(),
+            )
+        }
+        _ => return Err(other_err(format!("remote {} not available", name))),
+    })
 }
 
 #[instrument(skip(conn), level = Level::DEBUG)]

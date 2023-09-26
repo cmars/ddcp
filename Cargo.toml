@@ -20,6 +20,7 @@ capnp = "0.18.1"
 clap = {version = "4.4.3", features = ["derive", "env"]}
 exec = "0.3.1"
 flume = "0.11.0"
+rand = "0.8.5"
 rusqlite = {version = "0.29.0", features = ["load_extension"]}
 thiserror = "1.0.48"
 tokio = "1.32.0"

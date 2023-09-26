@@ -1,6 +1,6 @@
 use clap::Parser;
 use tracing::{error, info};
-use tracing_subscriber::filter::{self, EnvFilter};
+use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::prelude::*;
 
 use ddcp::{
@@ -29,6 +29,18 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     let (db_file, state_dir, ext_file) = (cli.db_file()?, cli.state_dir()?, cli.ext_file()?);
+
+    // Shell out to sqlite3 before other setup, if that's what we're doing
+    if let Commands::Shell = cli.commands {
+        let err = exec::Command::new("sqlite3")
+            .arg("-cmd")
+            .arg(format!(".load {}", ext_file).as_str())
+            .arg("-bail")
+            .arg(db_file)
+            .exec();
+        return Err(other_err(format!("failed to exec sqlite3: {:?}", err)));
+    }
+
     let mut app = DDCP::new(
         Some(db_file.as_str()),
         state_dir.as_str(),
@@ -67,15 +79,6 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Commands::Serve => app.serve().await,
-        Commands::Shell => {
-            let err = exec::Command::new("sqlite3")
-                .arg("-cmd")
-                .arg(format!(".load {}", ext_file).as_str())
-                .arg("-bail")
-                .arg(db_file)
-                .exec();
-            Err(other_err(format!("failed to exec sqlite3: {:?}", err)))
-        }
         Commands::Cleanup => Ok(()),
         Commands::Pull { name } => match name {
             Some(name) => {

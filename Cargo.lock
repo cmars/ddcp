@@ -838,6 +838,7 @@ dependencies = [
  "clap",
  "exec",
  "flume",
+ "rand",
  "rusqlite",
  "thiserror",
  "tokio",
