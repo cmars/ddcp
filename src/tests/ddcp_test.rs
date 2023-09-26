@@ -89,9 +89,6 @@ async fn test_sync_changes() {
         .expect("bob stage");
     assert_eq!(bob_stage_result, alice_version);
 
-    //let (_, bob_version) = status(&bob_conn).await.expect("bob status");
-    //assert_eq!(bob_version, 4); // synced changes
-
     // Alice merges latest changes from Bob
     let alice_stage_result = alice
         .merge(bob_site_id.clone(), bob_changes)

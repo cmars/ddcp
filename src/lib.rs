@@ -34,7 +34,6 @@ pub(crate) const SUBKEY_DB_VERSION: ValueSubkey = 1;
 pub(crate) const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
 
 pub(crate) const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
-
 pub(crate) const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
 
 impl DDCP {
@@ -111,8 +110,6 @@ impl DDCP {
     }
 
     pub async fn init(&mut self) -> Result<String> {
-        // Initialize tracker table
-        self.init_db().await?;
         // Load or create DHT key
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
@@ -120,11 +117,6 @@ impl DDCP {
         println!("{}", addr);
         self.dht_keypair = Some(local_dht);
         Ok(addr)
-    }
-
-    async fn init_db(&self) -> Result<()> {
-        // TODO: good place to run schema migrations
-        Ok(())
     }
 
     pub async fn push(&mut self) -> Result<(String, Vec<u8>, i64)> {
@@ -207,16 +199,19 @@ where site_id = ? and event = ?",
         let result = self
             .conn
             .call(move |conn| {
+                let tx = conn.transaction()?;
+                let mut ins_changes = tx.prepare(
+                    "
+insert into crsql_changes (
+    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                )?;
                 let mut max_db_version = -1;
                 for i in 0..changes.len() {
                     if changes[i].db_version > max_db_version {
                         max_db_version = changes[i].db_version;
                     }
-                    let n = conn.execute(
-                        "
-insert into crsql_changes (
-    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                    let n = ins_changes.execute(
                         params![
                             changes[i].table,
                             changes[i].pk,
@@ -231,7 +226,7 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                     )?;
                     eprintln!("merge change {} {:?} {:?}", n, changes[i], site_id);
                 }
-                conn.execute(
+                tx.execute(
                     "
 insert into crsql_tracked_peers (site_id, version, tag, event)
 values (?, ?, ?, ?)
@@ -243,6 +238,8 @@ on conflict do update set version = max(version, excluded.version)",
                         CRSQL_TRACKED_EVENT_RECEIVE
                     ],
                 )?;
+                drop(ins_changes);
+                tx.commit()?;
                 Ok(max_db_version)
             })
             .await?;
@@ -290,76 +287,6 @@ on conflict do update set version = max(version, excluded.version)",
             _ => return Err(other_err(format!("remote {} not available", name))),
         })
     }
-
-    /*
-        pub async fn merge(&mut self, name: &str) -> Result<()> {
-            let site_id = if let (Some(_), Some(site_id)) = self.node.store().load_remote(name).await? {
-                site_id
-            } else {
-                return Err(other_err(format!(
-                    "cannot merge from {}; no site_id: try fetching first",
-                    name
-                )));
-            };
-            self.conn
-                .call(move |conn| {
-                    let tx = conn.transaction()?;
-                    let max_db_version = match tx
-                        .query_row(
-                            "
-    select cast(max(version) as integer) as max_version from crsql_tracked_peers
-    where site_id = ? and tag = ? and event = ?",
-                            params![
-                                site_id,
-                                CRSQL_TRACKED_TAG_WHOLE_DATABASE,
-                                CRSQL_TRACKED_EVENT_DDCP_MERGE
-                            ],
-                            |row| row.get::<usize, Option<i64>>(0),
-                        )
-                        .optional()?
-                    {
-                        Some(Some(version)) => version,
-                        _ => -1,
-                    };
-                    let nrows = tx.execute(
-                        "
-    insert into crsql_changes (
-        \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
-    select
-        \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq
-    from ddcp_remote_changes
-    where site_id = ?
-    and db_version > ?",
-                        params![site_id, max_db_version],
-                    )?;
-                    if nrows > 0 {
-                        tx.execute(
-                            "
-    insert into crsql_tracked_peers (
-        site_id, version, tag, event)
-    select ?1, max(db_version), ?2, ?3
-    from ddcp_remote_changes
-    where site_id = ?1
-    order by db_version desc
-    limit 1",
-                            params![
-                                site_id,
-                                CRSQL_TRACKED_TAG_WHOLE_DATABASE,
-                                CRSQL_TRACKED_EVENT_DDCP_MERGE,
-                            ],
-                        )?;
-                    }
-                    tx.commit()
-                })
-                .await?;
-            Ok(())
-        }
-
-        pub async fn pull(&mut self, name: &str) -> Result<()> {
-            self.fetch(name).await?;
-            self.merge(name).await
-        }
-        */
 
     pub(crate) async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match self.node.store().load_local_keypair(name).await? {
