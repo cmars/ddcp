@@ -2,83 +2,93 @@
 
 Database-to-Database Copy (DDCP) over [Veilid](https://veilid.com).
 
-`ddcp` provides a Git-like CLI for fetching and merging SQLite database changes with Veilid peers.
+No servers, no cloud. No gods, no masters.
+
+# What is DDCP?
+
+[VLCN](https://vlcn.io/) is "like Git, for your data". DDCP (Database-to-Database Copy) is two things:
+
+- A Git-like CLI for VLCN
+- A Rust-native networking layer, which coordinates VLCN database changes
+
+Both operate over [Veilid](https://veilid.com) for simple, private, and secure p2p networking with strong cryptographic identities.
+
+# Why would I use DDCP?
+
+Rapid development of local-first distributed applications. Cut out the boilerplate and yak-shaving of APIs and focus on the data.
+
+Convert traditional RDBMS apps into local-first without having to re-architect around low-level CRDTs.
 
 # How do I use it?
+
+DDCP is still in the early stages of development but is already pretty interesting. Here's what you can do with it:
+
+## Initialize a SQLite database
+
+```bash
+ddcp init
+```
+
+This registers a Veilid DHT public key for your database.
+
+```bash
+2023-09-26T20:47:29.264567Z  INFO ddcp: VLD0:5bIixJHajo5GmeKnGIM-S8QlKbabIukCFWa-ihV8xqk
+```
+
+## Publish it
 
 ```bash
 ddcp serve
 ```
 
-This process must remain running in the background, in order for remotes to be able to fetch changes from this database.
+This process must remain running in the background in order for remotes to be able to fetch changes from this database.
 
-On first run, an empty database is created and a Veilid DHT address registered for synchronization.
+This process also prints the Veilid public key to give to your peers.
 
-```
-VLD0:LPrSd0aQgiOlTyDcdajBDKo19ge66zViznaSUmt-Bhw
-```
+## Populate it
 
-`ddcp serve` always prints this address, which can be shared with other peers.
-
-## Remotes
-
-Add a remote peers to synchronize with:
+Create some VLCN [CRRs (Conflict-free Replicated Relations)](https://vlcn.io/docs/appendix/crr) in your database. This can be done while DDCP is publishing your database. Changes will be automatically picked up by remote subscribers.
 
 ```bash
-ddcp remote add alice VLD0:XB2wAFtxvj3u2CxON099uMw0HdRiQltc-SkFaXc49hU
+ddcp shell < cr_tables.sql
 ```
 
-List remote databases:
+## Replicate it
+
+Add remote peer databases to synchronize with:
 
 ```bash
-ddcp remote list
+ddcp remote add alice VLD0:gO-fZJd0Zp5KxC-48J_BYE4vOmCyXJkLlH97uZbgBJg
 ```
 
-```
-alice VLD0:XB2wAFtxvj3u2CxON099uMw0HdRiQltc-SkFaXc49hU
-```
+The `VLD0:` prefix is optional.
 
-Remove a remote database:
+Give other peers your DHT key, so they can replicate your database.
 
-```bash
-ddcp remote remove alice
-```
+Note that all peers need to start with a common database schema in order to replicate it.
 
-## Pull remote changes
+# VLCN Caveats
 
-In order for database changes to propagate, the database must have the crsqlite extension loaded, and the tables must have been updated to a Conflict-free Replicated Relation (CRR). See VLCN documentation:
+CRRs have certain restrictions in order to work as expected, or even at all:
 
-- [Loading the extension](https://vlcn.io/docs/cr-sqlite/installation#loading-the-extension)
-- [crsql_as_crr](https://vlcn.io/docs/cr-sqlite/api-methods/crsql_as_crr)
+- Changes in CRRs MUST happen after loading the crsqlite.so extension. Running `ddcp shell` does this automatically for you. Something to keep in mind when using cr-sqlite from other applications though.
+- Peers have to share a common schema in order to replicate changes. VLCN supports schema migrations.
+- Replication happens on primary keys. Avoid auto-incrementing primary keys, these will not merge well. Prefer strong content identifiers or large random UUID-like keys.
 
-Note that these changes can be made in a separate process in your language of choice, so long that the extension has been loaded and the tables upgraded for replication.
+# Development
 
-Merge remote changes from a peer:
+## OCI image
 
-```bash
-ddcp pull peer1
-```
-
-## Pull remote changes
-
-Like git, a `pull` is a `fetch` followed by a `merge`:
-
-```bash
-ddcp pull
-```
-
-# How do I build it?
-
-## OCI images
-
-```bash
-podman build -t ddcp .
-```
-
-or
+OCI image build is based on Debian Bookworm.
 
 ```bash
 docker build -t ddcp .
+```
+
+Usage:
+
+```bash
+docker run -it -v $(pwd)/data:/data ddcp:latest serve
 ```
 
 ## Nix
@@ -90,41 +100,46 @@ nix develop
 cargo build
 ```
 
-Build scripts supporting a Debian-based OCI image build is planned.
+## Other platforms
 
-## Something else
+DDCP development requires Rust nightly because CR-SQLite requires nightly. DDCP [builds CR-SQLite](https://github.com/vlcn-io/cr-sqlite#building) from source in order to simplify distribution.
 
-This will probably work:
+This might probably work:
 
 ```bash
 git clone --recurse-submodules https://gitlab.com/cmars232/ddcp 
 cd ddcp/external/veilid
-# Set up Veilid dev env per instructions
+# Set up Veilid development environment per instructions there...
 cd ../..
 cargo build
 ```
 
-# How do I develop an application with it?
+# Roadmap
 
-More on this to come, but for now:
+DDCP is not yet stable and is still being actively worked on. Wire protocol, schemas, and APIs are all unstable and subject to breaking changes.
 
-Run `ddcp serve` in the one process.
+Several areas where DDCP still needs improvements:
 
-Develop and run VLCN / cr-sqlite based applications in another, using the same database file.
+### Large changesets
 
-# TODO
+Overcome `app_call` message size limits. Currently there's no checks on this so sending large changesets (like pictures of cats) will likely fail in uncontrolled ways. Veilid messages are typically limited to 16k.
 
-Automatic fetching and merging in `ddcp serve`.
+### Dynamically controlled DDCP agent
 
-Overcome `app_call` message size limits. Currently there's no checks on this so sending large changesets (like pictures of cats) will likely fail in uncontrolled ways.
+Control socket for `ddcp serve`, library so you don't have to operate the separate process yourself. Support managing remotes and forcing syncs on a running process.
 
-Control socket for `ddcp serve`, library so you don't have to operate the separate process yourself.
+### Changeset filtering and transformation
 
 More control over how changes are merged. In some use cases, you want to merge all peers' changes in a consistent state. In others, you probably want to keep peers' content separate but linked. Primitives that support these different synchronization patterns. Filters & transformations on crsql_changes. Authn and authz (who can change or pull what).
 
+### Missing Veilid features
+
+Replace polling with a watch on DHT changes (currently [not implemented](https://gitlab.com/veilid/veilid/-/blob/bd4b4233bfed5bdca4da3cacda3ad960e28daab5/veilid-core/src/storage_manager/mod.rs#L485) AFAICT).
 Veilid blockstore integration when it's ready.
 
-Some apps. Ideas for kinds of data that could be shared:
+### Some apps
+
+Ideas for kinds of data that could be shared:
 
 - Distributed BBS
 - Bookmarks & link sharing
