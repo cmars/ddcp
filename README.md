@@ -41,7 +41,7 @@ This registers a Veilid DHT public key for your database.
 ddcp serve
 ```
 
-```
+```bash
 2023-09-27T16:50:36.319921Z  INFO ddcp: Serving database at DHT key="VLD0:73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY"
 2023-09-27T16:50:36.321171Z  INFO ddcp: Database changed, updated status db_version=2 key="VLD0:73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY"
 ```
@@ -69,14 +69,13 @@ ddcp remote add alice 73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY
 
 The `VLD0:` prefix is optional.
 
-Changes from remotes are automatically applied to the local database.
+Changes from remotes are automatically applied to the local database while publishing changes.
 
 ```bash
 ddcp serve
 ```
 
-```
-...
+```bash
 2023-09-27T17:01:30.615367Z  INFO ddcp: Pulled changes from remote database remote_name="alice" db_version=5
 ```
 
@@ -129,7 +128,7 @@ cargo build
 
 # Roadmap
 
-DDCP is not yet stable and is still being actively worked on. Wire protocol, schemas, and APIs are all unstable and subject to breaking changes.
+DDCP is still a tech preview. Wire protocol, schemas, and APIs are all unstable and subject to breaking changes.
 
 Several areas where DDCP still needs improvements:
 
@@ -139,19 +138,20 @@ DHT addresses are currently publicly accessible; if you know the address, you ca
 
 Support sharing for authenticated DHTs.
 
+### Changeset filtering and transformation
+
+More control over how changes are merged. In some use cases, you want to merge all peers' changes in a consistent state. In others, you probably want to keep peers' content separate but linked. Primitives that support these different synchronization patterns. Filters & transformations on `crsql_changes`. Authn and authz (who can change or pull what).
+
 ### Large changesets
 
 Overcome `app_call` message size limits. Currently there's no checks on this so sending large changesets (like pictures of cats) will likely fail in uncontrolled ways. Veilid messages are typically limited to 32k.
 
 32k is probably enough for a row without large column data. Large column data should probably reference block storage, like PostgreSQL's Toast.
 
-### Changeset filtering and transformation
-
-More control over how changes are merged. In some use cases, you want to merge all peers' changes in a consistent state. In others, you probably want to keep peers' content separate but linked. Primitives that support these different synchronization patterns. Filters & transformations on `crsql_changes`. Authn and authz (who can change or pull what).
-
 ### Missing Veilid features
 
 Replace polling with a watch on DHT changes (currently [not implemented](https://gitlab.com/veilid/veilid/-/blob/bd4b4233bfed5bdca4da3cacda3ad960e28daab5/veilid-core/src/storage_manager/mod.rs#L485) AFAICT).
+
 Veilid blockstore integration when it's ready.
 
 ### Some apps
@@ -161,4 +161,11 @@ Ideas for kinds of data that could be shared:
 - Distributed BBS
 - Bookmarks & link sharing
 - Network scanning results
+- Remote sensor aggregation
 - Code hosting to get this project off Git\*\*b
+
+# About
+
+Name takes inspiration from [UUCP](https://en.wikipedia.org/wiki/UUCP) and [NNCP](https://www.complete.org/nncp/).
+
+Some of the Veilid core integration was derived from examples in [vldpipe](https://gitlab.com/vatueil/vldpipe).
