@@ -32,7 +32,7 @@ ddcp init
 This registers a Veilid DHT public key for your database.
 
 ```bash
-2023-09-26T20:47:29.264567Z  INFO ddcp: VLD0:5bIixJHajo5GmeKnGIM-S8QlKbabIukCFWa-ihV8xqk
+2023-09-27T16:50:03.646448Z  INFO ddcp: Registered database at DHT key="VLD0:73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY"
 ```
 
 ## Publish it
@@ -41,16 +41,22 @@ This registers a Veilid DHT public key for your database.
 ddcp serve
 ```
 
+```
+2023-09-27T16:50:36.319921Z  INFO ddcp: Serving database at DHT key="VLD0:73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY"
+2023-09-27T16:50:36.321171Z  INFO ddcp: Database changed, updated status db_version=2 key="VLD0:73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY"
+```
+
 This process must remain running in the background in order for remotes to be able to fetch changes from this database.
 
 This process also prints the Veilid public key to give to your peers.
 
 ## Populate it
 
-Create some VLCN [CRRs (Conflict-free Replicated Relations)](https://vlcn.io/docs/appendix/crr) in your database. This can be done while DDCP is publishing your database. Changes will be automatically picked up by remote subscribers.
+Create some VLCN [CRRs (Conflict-free Replicated Relations)](https://vlcn.io/docs/appendix/crr) in your database. This can be done while DDCP is running and publishing your database. Changes will be automatically picked up by remote subscribers.
 
 ```bash
-ddcp shell < cr_tables.sql
+ddcp shell < fixtures/cr_tables.sql
+ddcp shell < fixtures/ins_test_schema_alice.sql
 ```
 
 ## Replicate it
@@ -58,14 +64,21 @@ ddcp shell < cr_tables.sql
 Add remote peer databases to synchronize with:
 
 ```bash
-ddcp remote add alice VLD0:gO-fZJd0Zp5KxC-48J_BYE4vOmCyXJkLlH97uZbgBJg
+ddcp remote add alice 73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY
 ```
 
 The `VLD0:` prefix is optional.
 
-Give other peers your DHT key, so they can replicate your database.
+Changes from remotes are automatically applied to the local database.
 
-Note that all peers need to start with a common database schema in order to replicate it.
+```bash
+ddcp serve
+```
+
+```
+...
+2023-09-27T17:01:30.615367Z  INFO ddcp: Pulled changes from remote database remote_name="alice" db_version=5
+```
 
 # VLCN Caveats
 
@@ -79,7 +92,7 @@ CRRs have certain restrictions in order to work as expected, or even at all:
 
 ## OCI image
 
-Probably the easiest way right now to evaluate DDCP. OCI image build is based on Debian Bookworm.
+Probably the easiest way to evaluate DDCP. OCI image build is based on Debian Bookworm.
 
 ```bash
 docker build -t ddcp .
