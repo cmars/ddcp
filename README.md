@@ -100,7 +100,10 @@ docker build -t ddcp .
 Usage:
 
 ```bash
-docker run -it -v $(pwd)/data:/data ddcp:latest serve
+docker run -v $(pwd)/data:/data ddcp:latest init
+docker run -v $(pwd)/data:/data ddcp:latest remote add alice 73iT7NuqplS2nab1AH4P7lJYiQROR_k4NyUhag_K4DY
+cat fixtures/cr_test_schema.sql | docker run -v $(pwd)/data:/data -i ddcp:latest shell
+docker run -v $(pwd)/data:/data ddcp:latest pull
 ```
 
 ## Nix
