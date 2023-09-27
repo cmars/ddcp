@@ -5,10 +5,10 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{params, types::Value, OptionalExtension};
 use tokio::{select, signal, sync::oneshot, task::JoinHandle};
 use tokio_rusqlite::Connection;
-use tracing::{debug, error, info, instrument, warn, Level};
+use tracing::{debug, error, info, instrument, trace, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    Sequencing, Target, ValueSubkey, VeilidUpdate,
+    RouteId, Sequencing, Target, ValueSubkey, VeilidUpdate,
 };
 
 pub mod cli;
@@ -37,6 +37,9 @@ pub(crate) const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
 
 pub(crate) const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
 pub(crate) const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
+
+static LOCAL_TRACKER_PERIOD: Duration = Duration::from_secs(60);
+static REMOTE_TRACKER_PERIOD: Duration = Duration::from_secs(60);
 
 impl DDCP {
     pub async fn new(db_path: Option<&str>, state_path: &str, ext_path: &str) -> Result<DDCP> {
@@ -106,27 +109,25 @@ impl DDCP {
         Ok(VeilidNode::new(routing_context, updates))
     }
 
-    #[instrument(skip(self), level = Level::INFO)]
+    #[instrument(skip(self), level = Level::INFO, ret, err)]
     pub async fn wait_for_network(&self) -> Result<()> {
         self.node.wait_for_network().await
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn init(&mut self) -> Result<String> {
         // Load or create DHT key
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
-        info!("{}", addr);
         self.dht_keypair = Some(local_dht);
         Ok(addr)
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn push(&mut self) -> Result<(String, Vec<u8>, i64)> {
         // Load or create DHT key
         let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
-        info!("{}", addr);
         self.dht_keypair = Some(local_dht.clone());
 
         let key = local_dht.key().to_owned();
@@ -144,7 +145,7 @@ impl DDCP {
         Ok((addr, site_id, db_version))
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn pull(&mut self, name: &str) -> Result<(bool, i64)> {
         // Get latest status from DHT
         let (site_id, db_version, route_blob) = remote_status(self.node.clone_box(), name).await?;
@@ -155,7 +156,7 @@ impl DDCP {
             .call(move |conn| {
                 conn.query_row(
                     "
-select max(coalesce(version, -1)) from crsql_tracked_peers
+select max(coalesce(version, 0)) from crsql_tracked_peers
 where site_id = ? and event = ?",
                     params![site_id, CRSQL_TRACKED_EVENT_RECEIVE],
                     |row| row.get::<usize, Option<i64>>(0),
@@ -166,13 +167,15 @@ where site_id = ? and event = ?",
         {
             Some(Some(tracked_version)) => {
                 if db_version <= tracked_version {
-                    info!("remote {} is up to date", name);
+                    debug!("remote database {} is up to date", name);
                     return Ok((false, db_version));
                 }
                 tracked_version
             }
-            _ => -1,
+            _ => 0,
         };
+
+        debug!(db_version, tracked_version, "pulling changes");
 
         let route_id = self.node.import_remote_private_route(route_blob)?;
         let msg_bytes = self
@@ -187,13 +190,25 @@ where site_id = ? and event = ?",
         let resp = proto::decode_response_message(msg_bytes.as_slice())?;
 
         if let Response::Changes { site_id, changes } = resp {
-            self.merge(site_id, changes).await?;
+            self.merge(site_id.clone(), changes).await?;
+        } else {
+            return Err(Error::Other(
+                "Invalid response to changes request".to_string(),
+            ));
         }
 
-        Ok((true, tracked_version))
+        if let Err(e) = self.node.release_private_route(route_id) {
+            warn!(
+                route_id = route_id.to_string(),
+                err = format!("{:?}", e),
+                "Failed to release private route"
+            );
+        }
+
+        Ok((true, db_version))
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self, changes), level = Level::DEBUG, ret, err)]
     pub(crate) async fn merge(
         &mut self,
         site_id: Vec<u8>,
@@ -209,12 +224,12 @@ insert into crsql_changes (
     \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
 values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 )?;
-                let mut max_db_version = -1;
+                let mut max_db_version = 0;
                 for i in 0..changes.len() {
                     if changes[i].db_version > max_db_version {
                         max_db_version = changes[i].db_version;
                     }
-                    let n = ins_changes.execute(params![
+                    ins_changes.execute(params![
                         changes[i].table,
                         changes[i].pk,
                         changes[i].cid,
@@ -225,8 +240,9 @@ values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                         changes[i].cl,
                         changes[i].seq,
                     ])?;
-                    debug!("merge change {} {:?} {:?}", n, changes[i], site_id);
+                    trace!("merge change {:?} {:?}", changes[i], site_id);
                 }
+                trace!(site_id = format!("{:?}", site_id), max_db_version);
                 tx.execute(
                     "
 insert into crsql_tracked_peers (site_id, version, tag, event)
@@ -247,7 +263,7 @@ on conflict do update set version = max(version, excluded.version)",
         Ok(result)
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub(crate) async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match self.node.store().load_local_keypair(name).await? {
             Some((key, owner)) => self.node.open_dht_record(key, Some(owner)).await?,
@@ -278,7 +294,7 @@ on conflict do update set version = max(version, excluded.version)",
         Ok(dht)
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn cleanup(self) -> Result<()> {
         let remotes = self.remotes().await?;
         for (name, _) in remotes.iter() {
@@ -302,109 +318,149 @@ on conflict do update set version = max(version, excluded.version)",
         Ok(())
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
         let key = CryptoTyped::from_str(addr.as_str())?;
         self.node.store().store_remote_key(&name, &key).await?;
         Ok(())
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn remote_remove(&self, name: String) -> Result<()> {
         self.node.store().remove_remote(name).await?;
         Ok(())
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
         let result = self.node.store().remotes().await?;
         Ok(result)
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn serve(&mut self) -> Result<()> {
-        // Create a private route and publish it
-        let (route_id, route_blob) = self.node.new_private_route().await?;
-        let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
-        self.dht_keypair = Some(local_dht.clone());
-        self.node
-            .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
-            .await?;
+        let mut run = true;
 
-        let (stop_local_sender, stop_local_receiver) = oneshot::channel::<()>();
-        let local_tracker = self
-            .local_tracker(stop_local_receiver, local_dht.clone())
-            .await?;
-        let (stop_remote_sender, stop_remote_receiver) = oneshot::channel::<()>();
-        let remote_tracker = self.remote_tracker(stop_remote_receiver).await?;
+        while run {
+            // Create a private route and publish it
+            let (route_id, route_blob) = self.node.new_private_route().await?;
+            let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
+            self.dht_keypair = Some(local_dht.clone());
+            self.node
+                .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
+                .await?;
 
-        info!("{}", local_dht.key().to_string());
+            let (stop_local_sender, stop_local_receiver) = oneshot::channel::<()>();
+            let local_tracker = self
+                .local_tracker(stop_local_receiver, local_dht.clone())
+                .await?;
+            let (stop_remote_sender, stop_remote_receiver) = oneshot::channel::<()>();
+            let remote_tracker = self.remote_tracker(stop_remote_receiver).await?;
 
-        // Handle requests from peers
-        loop {
-            select! {
-                res = self.node.recv_updates_async() => {
-                    match res {
-                        Ok(update) => self.handle_update(update).await?,
-                        Err(e) => return Err(other_err(e)),
+            info!(key = local_dht.key().to_string(), "Serving database at DHT");
+
+            // Handle requests from peers
+            loop {
+                select! {
+                    res = self.node.recv_updates_async() => {
+                        match res {
+                            Ok(update) => {
+                                let restart = self.handle_update(update, &route_id).await?;
+                                if restart {
+                                    info!("Restarting");
+                                    break
+                                }
+                            }
+                            Err(e) => return Err(other_err(e)),
+                        }
+                    }
+                    _ = signal::ctrl_c() => {
+                        warn!("Interrupt received");
+                        if let Err(e) = stop_local_sender.send(()).map_err(|e| other_err(format!("{:?}", e))) {
+                            warn!(err = format!("{:?}", e), "Failed to send shutdown signal to local tracker");
+                        }
+                        if let Err(e) = stop_remote_sender.send(()).map_err(|e| other_err(format!("{:?}", e))) {
+                            warn!(err = format!("{:?}", e), "Failed to send shutdown signal to remote tracker");
+                        }
+                        run = false;
+                        break
                     }
                 }
-                _ = signal::ctrl_c() => {
-                    warn!("interrupt received");
-                    // TODO: warn on send failures
-                    let _ = stop_local_sender.send(()).map_err(|e| other_err(format!("{:?}", e)));
-                    let _ = stop_remote_sender.send(()).map_err(|e| other_err(format!("{:?}", e)));
-                    break
-                }
+            }
+            if let Err(e) = self.node.release_private_route(route_id) {
+                warn!(
+                    route_id = route_id.to_string(),
+                    err = format!("{:?}", e),
+                    "Failed to release private route"
+                );
+            }
+            if let Err(e) = local_tracker.await.map_err(other_err)? {
+                warn!(
+                    err = format!("{:?}", e),
+                    "Error shutting down local tracker"
+                );
+            }
+            if let Err(e) = remote_tracker.await.map_err(other_err)? {
+                warn!(
+                    err = format!("{:?}", e),
+                    "Error shutting down remote tracker"
+                );
             }
         }
-        self.node.release_private_route(route_id)?;
-        local_tracker.await.map_err(other_err)??;
-        remote_tracker.await.map_err(other_err)??;
         Ok(())
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
-    pub(crate) async fn handle_update(&mut self, update: VeilidUpdate) -> Result<()> {
+    pub(crate) async fn handle_update(
+        &mut self,
+        update: VeilidUpdate,
+        current_route: &RouteId,
+    ) -> Result<bool> {
         match update {
-            // TODO: handle routing changes
-            // TODO: handle connectivity changes (re-announce DHT on re-connect)
             VeilidUpdate::AppCall(app_call) => {
                 let request = match proto::decode_request_message(app_call.message()) {
                     Ok(r) => r,
                     Err(e) => {
-                        warn!("invalid request: {:?}", e);
-                        return Ok(());
+                        warn!(err = format!("{:?}", e), "Invalid app_call request");
+                        return Ok(false);
                     }
                 };
                 match request {
-                    // TODO: spawn responder to unblock event loop
                     Request::Status => {
                         let (site_id, db_version) = status(&self.conn).await?;
                         let resp = proto::encode_response_message(Response::Status {
                             site_id,
                             db_version,
                         })?;
-                        self.node.app_call_reply(app_call.id(), resp).await?;
+                        let node = self.node.clone_box();
+                        tokio::spawn(async move { node.app_call_reply(app_call.id(), resp).await });
                     }
                     Request::Changes { since_db_version } => {
                         let (site_id, changes) = changes(&self.conn, since_db_version).await?;
                         let resp =
                             proto::encode_response_message(Response::Changes { site_id, changes })?;
-                        self.node.app_call_reply(app_call.id(), resp).await?;
+                        let node = self.node.clone_box();
+                        tokio::spawn(async move { node.app_call_reply(app_call.id(), resp).await });
                     }
                 }
             }
             VeilidUpdate::Shutdown => {
                 return Err(Error::VeilidAPI(veilid_core::VeilidAPIError::Shutdown))
             }
-            _ => return Ok(()),
+            VeilidUpdate::RouteChange(route_change) => {
+                for dead_route in route_change.dead_routes {
+                    if dead_route == *current_route {
+                        warn!(route = current_route.to_string(), "Current route is dead");
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => return Ok(false),
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Poll local db for changes in latest db version, update DHT.
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, err)]
     async fn local_tracker(
         &self,
         mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
@@ -413,12 +469,13 @@ on conflict do update set version = max(version, excluded.version)",
         let conn = self.conn.clone();
         let mut node = self.node.clone_box();
         let key = local_dht.key().to_owned();
-        let mut timer = tokio::time::interval(Duration::from_secs(60));
+        let mut timer = tokio::time::interval(LOCAL_TRACKER_PERIOD);
 
         let h = tokio::spawn(async move {
             let mut prev_db_version = -1;
             loop {
                 select! {
+                    // TODO: watch db for changes (filesystem changes, sqlite magic, control socket)
                     _ = timer.tick() => {
                         let (site_id, db_version) = status(&conn).await?;
                         if db_version <= prev_db_version {
@@ -429,7 +486,7 @@ on conflict do update set version = max(version, excluded.version)",
                         node
                             .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
                             .await?;
-                        debug!(db_version, key = key.to_string(), "updated DHT");
+                        info!(db_version, key = key.to_string(), "Database changed, updated status");
                         prev_db_version = db_version;
                     }
                     _ = &mut stop_receiver => {
@@ -443,32 +500,33 @@ on conflict do update set version = max(version, excluded.version)",
     }
 
     /// Poll remotes for changes.
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[instrument(skip(self), level = Level::DEBUG, err)]
     async fn remote_tracker(
         &self,
         mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<JoinHandle<Result<()>>> {
         let mut ddcp = Self::new_conn_node(self.conn.clone(), self.node.clone_box());
-        let mut timer = tokio::time::interval(Duration::from_secs(60));
+        let mut timer = tokio::time::interval(REMOTE_TRACKER_PERIOD);
 
         let h = tokio::spawn(async move {
             let remotes = ddcp.remotes().await?;
             let mut rng: StdRng = SeedableRng::from_entropy();
             loop {
                 select! {
+                    // TODO: use Veilid DHT watch when it's implemented
                     _ = timer.tick() => {
                         let remote_index = rng.gen_range(0..remotes.len());
                         let remote_name = &remotes[remote_index].0;
                         match ddcp.pull(remote_name).await {
-                            Ok((updated, version)) => {
+                            Ok((updated, db_version)) => {
                                 if updated {
-                                    info!(remote_name, updated, version, "remote_tracker");
+                                    info!(remote_name, db_version, "Pulled changes from remote database");
                                 } else {
-                                    debug!(remote_name, updated, version, "remote_tracker");
+                                    debug!(remote_name, updated, db_version, "no changes");
                                 }
                             }
                             Err(e) => {
-                                error!("failed to pull from {}: {:?}", remote_name, e);
+                                error!("Failed to pull from {}: {:?}", remote_name, e);
                             }
                         }
                     }
@@ -483,7 +541,7 @@ on conflict do update set version = max(version, excluded.version)",
     }
 }
 
-#[instrument(skip(node), level = Level::DEBUG)]
+#[instrument(skip(node), level = Level::DEBUG, err)]
 pub(crate) async fn remote_status(
     node: Box<dyn Node>,
     name: &str,
@@ -526,13 +584,13 @@ pub(crate) async fn remote_status(
     })
 }
 
-#[instrument(skip(conn), level = Level::DEBUG)]
+#[instrument(skip(conn), level = Level::DEBUG, ret, err)]
 pub async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
     let (site_id, db_version) = conn
         .call(|c| {
             c.query_row(
                 "
-select crsql_site_id(), crsql_db_version();",
+select crsql_site_id(), coalesce((select max(db_version) from crsql_changes where site_id is null), 0);",
                 [],
                 |row| Ok((row.get::<usize, Vec<u8>>(0)?, row.get::<usize, i64>(1)?)),
             )

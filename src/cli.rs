@@ -159,7 +159,7 @@ impl Cli {
                 let exe_dir = exe.parent().expect("executable has a parent directory");
                 Ok(String::from(
                     exe_dir
-                        // TODO: dylib on macos, dll on windows
+                        // TODO: dylib on macos, dll on windows?
                         .join(PathBuf::from("crsqlite.so"))
                         .as_os_str()
                         .to_str()

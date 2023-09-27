@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use flume::Receiver;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 use veilid_core::{
     CryptoKind, DHTRecordDescriptor, DHTSchema, KeyPair, OperationId, RouteId, RoutingContext,
     Target, TypedKey, ValueData, ValueSubkey, VeilidAPIResult, VeilidUpdate,
@@ -104,17 +104,21 @@ impl Node for VeilidNode {
             let res = self.updates.recv_async().await;
             match res {
                 Ok(VeilidUpdate::Attachment(attachment)) => {
-                    debug!("{:?}", attachment);
                     if attachment.public_internet_ready {
+                        info!(
+                            state = attachment.state.to_string(),
+                            public_internet_ready = attachment.public_internet_ready,
+                            "Connected"
+                        );
                         return Ok(());
                     }
+                    info!(
+                        state = attachment.state.to_string(),
+                        public_internet_ready = attachment.public_internet_ready,
+                        "Waiting for network"
+                    );
                 }
-                Ok(VeilidUpdate::Config(_)) => {}
-                Ok(VeilidUpdate::Log(_)) => {}
-                Ok(VeilidUpdate::Network(_)) => {}
-                Ok(u) => {
-                    debug!("{:?}", u);
-                }
+                Ok(_) => {}
                 Err(e) => {
                     return Err(Error::Other(e.to_string()));
                 }
@@ -134,7 +138,11 @@ impl Node for VeilidNode {
         // Attempt to close DHT record in local store.
         if let Some(dht) = maybe_dht {
             if let Err(e) = self.close_dht_record(dht.key().to_owned()).await {
-                warn!("failed to close DHT record: {:?}", e);
+                warn!(
+                    key = dht.key().to_string(),
+                    err = format!("{:?}", e),
+                    "Failed to close DHT record"
+                );
             }
         }
 

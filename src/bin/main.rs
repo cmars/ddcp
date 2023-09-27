@@ -55,12 +55,12 @@ async fn run() -> Result<()> {
     let result = match cli.commands {
         Commands::Init => {
             let addr = app.init().await?;
-            info!("{}", addr);
+            info!(key = addr, "Registered database at DHT");
             Ok(())
         }
         Commands::Push => {
             let (addr, _site_id, version) = app.push().await?;
-            info!("{} at version {}", addr, version);
+            info!(key = addr, db_version = version, "Pushed database status to DHT");
             Ok(())
         }
         Commands::Remote(RemoteArgs {

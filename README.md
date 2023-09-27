@@ -120,6 +120,12 @@ DDCP is not yet stable and is still being actively worked on. Wire protocol, sch
 
 Several areas where DDCP still needs improvements:
 
+### Private sharing
+
+DHT addresses are currently publicly accessible; if you know the address, you can pull from the database. This is OK for public distribution of data sets (blogs, "everybody edits", stuff like that), but not for private apps.
+
+Support sharing for authenticated DHTs.
+
 ### Large changesets
 
 Overcome `app_call` message size limits. Currently there's no checks on this so sending large changesets (like pictures of cats) will likely fail in uncontrolled ways. Veilid messages are typically limited to 32k.
