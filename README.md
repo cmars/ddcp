@@ -6,10 +6,10 @@ No servers, no cloud. No gods, no masters.
 
 # What is DDCP?
 
-[VLCN](https://vlcn.io/) is "like Git, for your data". DDCP (Database-to-Database Copy) is two things:
+DDCP (Database-to-Database Copy) is two things:
 
-- A Git-like CLI for VLCN
-- A Rust-native networking layer, which coordinates VLCN database changes
+- A Git-like CLI for [VLCN](https://vlcn.io/)'s CR-SQLite.
+- A Rust-native networking layer, which coordinates VLCN database changes among remote peers.
 
 Both operate over [Veilid](https://veilid.com) for simple, private, and secure p2p networking with strong cryptographic identities.
 
@@ -79,7 +79,7 @@ CRRs have certain restrictions in order to work as expected, or even at all:
 
 ## OCI image
 
-OCI image build is based on Debian Bookworm.
+Probably the easiest way right now to evaluate DDCP. OCI image build is based on Debian Bookworm.
 
 ```bash
 docker build -t ddcp .
@@ -122,15 +122,13 @@ Several areas where DDCP still needs improvements:
 
 ### Large changesets
 
-Overcome `app_call` message size limits. Currently there's no checks on this so sending large changesets (like pictures of cats) will likely fail in uncontrolled ways. Veilid messages are typically limited to 16k.
+Overcome `app_call` message size limits. Currently there's no checks on this so sending large changesets (like pictures of cats) will likely fail in uncontrolled ways. Veilid messages are typically limited to 32k.
 
-### Dynamically controlled DDCP agent
-
-Control socket for `ddcp serve`, library so you don't have to operate the separate process yourself. Support managing remotes and forcing syncs on a running process.
+32k is probably enough for a row without large column data. Large column data should probably reference block storage, like PostgreSQL's Toast.
 
 ### Changeset filtering and transformation
 
-More control over how changes are merged. In some use cases, you want to merge all peers' changes in a consistent state. In others, you probably want to keep peers' content separate but linked. Primitives that support these different synchronization patterns. Filters & transformations on crsql_changes. Authn and authz (who can change or pull what).
+More control over how changes are merged. In some use cases, you want to merge all peers' changes in a consistent state. In others, you probably want to keep peers' content separate but linked. Primitives that support these different synchronization patterns. Filters & transformations on `crsql_changes`. Authn and authz (who can change or pull what).
 
 ### Missing Veilid features
 
