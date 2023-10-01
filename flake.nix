@@ -75,7 +75,7 @@
             cargo-watch
             rustfmt
             rust-analyzer
-            rust-bin.nightly.latest.default
+            (rust-bin.nightly.latest.default.override { extensions = [ "rust-src" ]; })
             clang
             llvmPackages.llvm
             llvmPackages.libclang
