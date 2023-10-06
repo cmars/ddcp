@@ -1,10 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
-use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{params, types::Value, OptionalExtension};
-use tokio::{select, signal, sync::oneshot, task::JoinHandle};
+use tokio::{
+    select, signal,
+    task::{JoinHandle, JoinSet},
+};
 use tokio_rusqlite::Connection;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
@@ -28,7 +31,7 @@ pub struct DDCP {
     dht_keypair: Option<DHTRecordDescriptor>,
 }
 
-pub(crate) const LOCAL_KEYPAIR_NAME: &'static str = "__local";
+pub(crate) const LOCAL_KEYPAIR_NAME: &str = "__local";
 
 pub(crate) const DHT_SUBKEY_COUNT: u16 = 3;
 pub(crate) const SUBKEY_SITE_ID: ValueSubkey = 0;
@@ -225,22 +228,22 @@ insert into crsql_changes (
 values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 )?;
                 let mut max_db_version = 0;
-                for i in 0..changes.len() {
-                    if changes[i].db_version > max_db_version {
-                        max_db_version = changes[i].db_version;
+                for change in changes {
+                    if change.db_version > max_db_version {
+                        max_db_version = change.db_version;
                     }
                     ins_changes.execute(params![
-                        changes[i].table,
-                        changes[i].pk,
-                        changes[i].cid,
-                        changes[i].val,
-                        changes[i].col_version,
-                        changes[i].db_version,
+                        change.table,
+                        change.pk,
+                        change.cid,
+                        change.val,
+                        change.col_version,
+                        change.db_version,
                         &site_id,
-                        changes[i].cl,
-                        changes[i].seq,
+                        change.cl,
+                        change.seq,
                     ])?;
-                    trace!("merge change {:?} {:?}", changes[i], site_id);
+                    trace!("merge change {:?} {:?}", change, site_id);
                 }
                 trace!(site_id = format!("{:?}", site_id), max_db_version);
                 tx.execute(
@@ -350,12 +353,11 @@ on conflict do update set version = max(version, excluded.version)",
                 .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
                 .await?;
 
-            let (stop_local_sender, stop_local_receiver) = oneshot::channel::<()>();
+            let cancel = CancellationToken::new();
             let local_tracker = self
-                .local_tracker(stop_local_receiver, local_dht.clone())
+                .local_tracker(cancel.clone(), local_dht.clone())
                 .await?;
-            let (stop_remote_sender, stop_remote_receiver) = oneshot::channel::<()>();
-            let remote_tracker = self.remote_tracker(stop_remote_receiver).await?;
+            let mut remote_tracker = self.remote_tracker(cancel.clone()).await?;
 
             info!(key = local_dht.key().to_string(), "Serving database at DHT");
 
@@ -376,12 +378,7 @@ on conflict do update set version = max(version, excluded.version)",
                     }
                     _ = signal::ctrl_c() => {
                         warn!("Interrupt received");
-                        if let Err(e) = stop_local_sender.send(()).map_err(|e| other_err(format!("{:?}", e))) {
-                            warn!(err = format!("{:?}", e), "Failed to send shutdown signal to local tracker");
-                        }
-                        if let Err(e) = stop_remote_sender.send(()).map_err(|e| other_err(format!("{:?}", e))) {
-                            warn!(err = format!("{:?}", e), "Failed to send shutdown signal to remote tracker");
-                        }
+                        cancel.cancel();
                         run = false;
                         break
                     }
@@ -394,17 +391,16 @@ on conflict do update set version = max(version, excluded.version)",
                     "Failed to release private route"
                 );
             }
-            if let Err(e) = local_tracker.await.map_err(other_err)? {
-                warn!(
-                    err = format!("{:?}", e),
-                    "Error shutting down local tracker"
-                );
+            while let Some(res) = remote_tracker.join_next().await {
+                if let Err(e) = res {
+                    warn!(
+                        err = format!("{:?}", e),
+                        "Error shutting down remote tracker"
+                    );
+                }
             }
-            if let Err(e) = remote_tracker.await.map_err(other_err)? {
-                warn!(
-                    err = format!("{:?}", e),
-                    "Error shutting down remote tracker"
-                );
+            if let Err(e) = local_tracker.await.map_err(other_err)? {
+                warn!(err = format!("{:?}", e), "Error shutting own local tracker");
             }
         }
         Ok(())
@@ -463,7 +459,7 @@ on conflict do update set version = max(version, excluded.version)",
     #[instrument(skip(self), level = Level::DEBUG, err)]
     async fn local_tracker(
         &self,
-        mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
+        cancel_token: CancellationToken,
         local_dht: DHTRecordDescriptor,
     ) -> Result<JoinHandle<Result<()>>> {
         let conn = self.conn.clone();
@@ -489,7 +485,7 @@ on conflict do update set version = max(version, excluded.version)",
                         info!(db_version, key = key.to_string(), "Database changed, updated status");
                         prev_db_version = db_version;
                     }
-                    _ = &mut stop_receiver => {
+                    _ = cancel_token.cancelled() => {
                         break;
                     }
                 }
@@ -500,24 +496,22 @@ on conflict do update set version = max(version, excluded.version)",
     }
 
     /// Poll remotes for changes.
-    #[instrument(skip(self), level = Level::DEBUG, err)]
-    async fn remote_tracker(
-        &self,
-        mut stop_receiver: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<JoinHandle<Result<()>>> {
-        let mut ddcp = Self::new_conn_node(self.conn.clone(), self.node.clone_box());
-        let mut timer = tokio::time::interval(REMOTE_TRACKER_PERIOD);
+    #[instrument(skip(self, cancel_token), level = Level::DEBUG, err)]
+    async fn remote_tracker(&self, cancel_token: CancellationToken) -> Result<JoinSet<Result<()>>> {
+        let mut joins = JoinSet::new();
+        let remotes = self.remotes().await?;
+        for remote in remotes {
+            let mut ddcp = Self::new_conn_node(self.conn.clone(), self.node.clone_box());
+            let mut timer = tokio::time::interval(REMOTE_TRACKER_PERIOD);
+            let remote_cancel = cancel_token.clone();
 
-        let h = tokio::spawn(async move {
-            let remotes = ddcp.remotes().await?;
-            let mut rng: StdRng = SeedableRng::from_entropy();
+            let remote_name = remote.0.clone();
+            joins.spawn(async move {
             loop {
                 select! {
                     // TODO: use Veilid DHT watch when it's implemented
                     _ = timer.tick() => {
-                        let remote_index = rng.gen_range(0..remotes.len());
-                        let remote_name = &remotes[remote_index].0;
-                        match ddcp.pull(remote_name).await {
+                        match ddcp.pull(&remote_name).await {
                             Ok((updated, db_version)) => {
                                 if updated {
                                     info!(remote_name, db_version, "Pulled changes from remote database");
@@ -530,14 +524,15 @@ on conflict do update set version = max(version, excluded.version)",
                             }
                         }
                     }
-                    _ = &mut stop_receiver => {
+                    _ = remote_cancel.cancelled() => {
                         break;
                     }
                 }
             }
             Ok(())
         });
-        Ok(h)
+        }
+        Ok(joins)
     }
 }
 
@@ -560,16 +555,19 @@ pub(crate) async fn remote_status(
     let maybe_route_blob = node
         .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
         .await?;
-    let _ = node.close_dht_record(dht.key().to_owned()).await?;
+    if let Err(e) = node.close_dht_record(dht.key().to_owned()).await {
+        warn!(
+            err = format!("{:?}", e),
+            key = dht.key().to_string(),
+            "failed to close dht record"
+        )
+    }
 
-    match (prior_site_id, &maybe_site_id) {
-        (None, Some(site_id)) => {
-            node.store()
-                .store_remote_site_id(name, site_id.data().to_owned())
-                .await?;
-        }
-        _ => {}
-    };
+    if let (None, Some(site_id)) = (prior_site_id, &maybe_site_id) {
+        node.store()
+            .store_remote_site_id(name, site_id.data().to_owned())
+            .await?;
+    }
 
     Ok(match (maybe_site_id, maybe_db_version, maybe_route_blob) {
         (Some(sid), Some(dbv), Some(rt)) => {

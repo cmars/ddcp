@@ -25,6 +25,7 @@ rusqlite = {version = "0.29.0", features = ["load_extension"]}
 thiserror = "1.0.48"
 tokio = "1.32.0"
 tokio-rusqlite = "0.4.0"
+tokio-util = "0.7.9"
 tracing = { version = "0.1.37", features = ["log", "attributes"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 veilid-core = { path = "external/veilid/veilid-core" }
