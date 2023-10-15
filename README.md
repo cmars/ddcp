@@ -117,7 +117,7 @@ cargo build
 
 ## Other platforms
 
-DDCP development requires Rust nightly because CR-SQLite requires nightly. DDCP [builds CR-SQLite](https://github.com/vlcn-io/cr-sqlite#building) from source in order to simplify distribution.
+DDCP development assumes Rust stable. DDCP vendors and builds [CR-SQLite](https://github.com/vlcn-io/cr-sqlite#building) and [Veilid](https://gitlab.com/veilid/veilid) from source in order to simplify distribution.
 
 This might probably work:
 
