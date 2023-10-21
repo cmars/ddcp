@@ -18,6 +18,7 @@ pub mod cli;
 mod error;
 mod node;
 mod proto;
+mod status;
 mod store;
 pub mod veilid_config;
 

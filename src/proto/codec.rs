@@ -8,7 +8,7 @@ use rusqlite::types::Value;
 
 use super::{
     ddcp_capnp::request,
-    ddcp_capnp::{change_value, response},
+    ddcp_capnp::{change_value, response, node_status},
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -39,6 +39,8 @@ pub enum Response {
         changes: Vec<Change>,
     },
 }
+
+
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Change {
@@ -174,6 +176,42 @@ pub fn decode_response(reader: &response::Reader) -> Result<Response> {
             }
         }
         response::Which::Changes(Err(e)) => return Err(e.into()),
+    })
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct NodeStatus {
+    pub site_id: Vec<u8>,
+    pub db_version: i64,
+    pub route: Vec<u8>,
+}
+
+pub fn encode_node_status_message(node_status: &NodeStatus) -> Result<Vec<u8>> {
+    let mut builder = message::Builder::new_default();
+    let mut node_status_builder = builder.get_root::<node_status::Builder>()?;
+    encode_node_status(node_status, &mut node_status_builder);
+    Ok(serialize::write_message_segments_to_words(&builder))
+}
+
+pub fn decode_node_status_message(msg_bytes: &[u8]) -> Result<NodeStatus> {
+    let reader = serialize::read_message(msg_bytes, ReaderOptions::new())?;
+    let node_status_reader = reader.get_root::<node_status::Reader>()?;
+    decode_node_status(&node_status_reader)
+}
+
+fn encode_node_status(node_status: &NodeStatus, builder: &mut node_status::Builder) {
+    let mut db_status_builder = builder.reborrow().init_db();
+    db_status_builder.set_site_id(node_status.site_id.as_slice());
+    db_status_builder.set_db_version(node_status.db_version);
+    builder.set_route(node_status.route.as_slice());
+}
+
+fn decode_node_status(reader: &node_status::Reader) -> Result<NodeStatus> {
+    let db_status = reader.get_db()?;
+    Ok(NodeStatus{
+        site_id: db_status.get_site_id()?.to_vec(),
+        db_version: db_status.get_db_version(),
+        route: reader.get_route()?.to_vec(),
     })
 }
 

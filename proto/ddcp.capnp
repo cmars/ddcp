@@ -13,7 +13,7 @@ struct ChangesParams {
 
 struct Response {
     union {
-        status @0 :Status;
+        status @0 :DBStatus;
         changes @1 :ChangesResult;
     }
 }
@@ -23,9 +23,14 @@ struct ChangesResult {
     changes @1 :List(Change);
 }
 
-struct Status {
+struct DBStatus {
     siteId @0 :Data;
     dbVersion @1 :Int64;
+}
+
+struct NodeStatus {
+    db @0 :DBStatus;
+    route @1 :Data;
 }
 
 struct Change {
