@@ -4,7 +4,7 @@ use flume::Receiver;
 use tracing::{info, warn};
 use veilid_core::{
     CryptoKind, DHTRecordDescriptor, DHTSchema, KeyPair, OperationId, RouteId, RoutingContext,
-    Target, TypedKey, ValueData, ValueSubkey, VeilidAPIResult, VeilidUpdate,
+    Target, TypedKey, ValueData, ValueSubkey, VeilidAPIResult, VeilidUpdate, SharedSecret,
 };
 
 use crate::{
@@ -18,6 +18,12 @@ pub trait Node: Send + Sync {
     fn clone_box(&self) -> Box<dyn Node>;
 
     fn store(&self) -> &dyn Store;
+
+    fn generate_peer_secret(&self) -> Result<SharedSecret>;
+
+    fn encrypt_message(&self, plaintext: &[u8], secret: SharedSecret) -> Result<Vec<u8>>;
+
+    fn decrypt_message(&self, msg_bytes: &[u8], secret: SharedSecret) -> Result<Vec<u8>>;
 
     async fn wait_for_network(&self) -> Result<()>;
 
@@ -96,6 +102,38 @@ impl Node for VeilidNode {
 
     fn store(&self) -> &dyn Store {
         self.table_store.as_ref()
+    }
+
+    fn generate_peer_secret(&self) -> Result<SharedSecret> {
+        Ok(vld0_crypto_system(&self.routing_context.api().crypto()?)?.random_shared_secret())
+    }
+
+    fn encrypt_message(&self, plaintext: &[u8], secret: SharedSecret) -> Result<Vec<u8>> {
+        let result = match secret {
+            Some(ref s) => {
+                let c = vld0_crypto_system(&self.routing_context.api().crypto()?)?;
+                let nonce = c.random_nonce();
+                let ciphertext = c.encrypt_aead(plaintext, &nonce, s, None)?;
+                let mut result = nonce.to_vec();
+                result.extend(ciphertext);
+                result
+            }
+            None => plaintext,
+        };
+        Ok(result)
+    }
+
+    fn decrypt_message(&self, msg_bytes: &[u8], secret: SharedSecret) -> Result<Vec<u8>> {
+        let plaintext = match secret {
+            Some(ref s) => {
+                let c = vld0_crypto_system(&self.routing_context.api().crypto()?)?;
+                let nonce = Nonce::new(msg_bytes[0..24].try_into().map_err(other_err)?);
+                let ciphertext = &msg_bytes[24..];
+                c.decrypt_aead(ciphertext, &nonce, s, None)?
+            }
+            None => msg_bytes.to_vec(),
+        };
+        Ok(plaintext)
     }
 
     async fn wait_for_network(&self) -> Result<()> {
@@ -218,4 +256,10 @@ impl Node for VeilidNode {
     ) -> VeilidAPIResult<Option<ValueData>> {
         self.routing_context.set_dht_value(key, subkey, data).await
     }
+}
+
+fn vld0_crypto_system(crypto: &Crypto) -> Result<CryptoSystemVersion> {
+    Ok(crypto
+        .get(CRYPTO_KIND_VLD0)
+        .ok_or(other_err("missing VLD0"))?)
 }

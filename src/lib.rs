@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
 use rusqlite::{params, types::Value, OptionalExtension};
+use status_manager::StatusManager;
 use tokio::{
     select, signal,
     task::{JoinHandle, JoinSet},
@@ -11,25 +12,25 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    RouteId, Sequencing, Target, ValueSubkey, VeilidUpdate,
+    RouteId, Sequencing, Target, ValueSubkey, VeilidUpdate, SharedSecret,
 };
 
 pub mod cli;
 mod error;
 mod node;
 mod proto;
-mod status;
 mod store;
 pub mod veilid_config;
 
 pub use error::{other_err, Error, Result};
 pub use node::{Node, VeilidNode};
-use proto::{Request, Response};
+use proto::{Request, Response, NodeStatus};
 
 pub struct DDCP {
     conn: Connection,
     node: Box<dyn Node>,
     dht_keypair: Option<DHTRecordDescriptor>,
+    peer_secret: Option<SharedSecret>,
 }
 
 pub(crate) const LOCAL_KEYPAIR_NAME: &str = "__local";
@@ -53,6 +54,7 @@ impl DDCP {
             conn,
             node,
             dht_keypair: None,
+            peer_secret: None,
         })
     }
 
@@ -61,6 +63,7 @@ impl DDCP {
             conn,
             node,
             dht_keypair: None,
+            peer_secret: None,
         }
     }
 
@@ -119,18 +122,39 @@ impl DDCP {
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub async fn init(&mut self) -> Result<String> {
+    pub async fn init(&mut self, mnemonic: Option<String>) -> Result<String> {
+        // Load or create peer secret
+        self.peer_secret = Some(match mnemonic {
+            Some(phrase) => {
+                todo!("import key")
+            }
+            None => {
+                self.ensure_peer_secret()?
+            }
+        });
+
         // Load or create DHT key
-        let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
+        let local_dht = self.ensure_dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
         self.dht_keypair = Some(local_dht);
         Ok(addr)
     }
 
+    fn ensure_peer_secret(&self) -> Result<SharedSecret> {
+        Ok(match self.node.store().load_peer_secret().await? {
+            Some(secret) => secret,
+            None => {
+                let secret = self.node.generate_peer_secret()?;
+                self.node.store().store_peer_secret(secret).await?;
+                secret
+            }
+        })
+    }
+
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn push(&mut self) -> Result<(String, Vec<u8>, i64)> {
         // Load or create DHT key
-        let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
+        let local_dht = self.ensure_dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
         self.dht_keypair = Some(local_dht.clone());
 
@@ -186,12 +210,12 @@ where site_id = ? and event = ?",
             .node
             .app_call(
                 Target::PrivateRoute(route_id),
-                proto::encode_request_message(Request::Changes {
+                proto::encode_message(Request::Changes {
                     since_db_version: tracked_version,
                 })?,
             )
             .await?;
-        let resp = proto::decode_response_message(msg_bytes.as_slice())?;
+        let resp = proto::decode_message::<Response>(msg_bytes.as_slice())?;
 
         if let Response::Changes { site_id, changes } = resp {
             self.merge(site_id.clone(), changes).await?;
@@ -268,7 +292,7 @@ on conflict do update set version = max(version, excluded.version)",
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub(crate) async fn dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
+    pub(crate) async fn ensure_dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
         let dht = match self.node.store().load_local_keypair(name).await? {
             Some((key, owner)) => self.node.open_dht_record(key, Some(owner)).await?,
             None => {
@@ -348,7 +372,7 @@ on conflict do update set version = max(version, excluded.version)",
         while run {
             // Create a private route and publish it
             let (route_id, route_blob) = self.node.new_private_route().await?;
-            let local_dht = self.dht_keypair(LOCAL_KEYPAIR_NAME).await?;
+            let local_dht = self.ensure_dht_keypair(LOCAL_KEYPAIR_NAME).await?;
             self.dht_keypair = Some(local_dht.clone());
             self.node
                 .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
@@ -414,7 +438,7 @@ on conflict do update set version = max(version, excluded.version)",
     ) -> Result<bool> {
         match update {
             VeilidUpdate::AppCall(app_call) => {
-                let request = match proto::decode_request_message(app_call.message()) {
+                let request = match proto::decode_message::<Request>(app_call.message()) {
                     Ok(r) => r,
                     Err(e) => {
                         warn!(err = format!("{:?}", e), "Invalid app_call request");
@@ -424,7 +448,7 @@ on conflict do update set version = max(version, excluded.version)",
                 match request {
                     Request::Status => {
                         let (site_id, db_version) = status(&self.conn).await?;
-                        let resp = proto::encode_response_message(Response::Status {
+                        let resp = proto::encode_message(Response::Status {
                             site_id,
                             db_version,
                         })?;
@@ -434,7 +458,7 @@ on conflict do update set version = max(version, excluded.version)",
                     Request::Changes { since_db_version } => {
                         let (site_id, changes) = changes(&self.conn, since_db_version).await?;
                         let resp =
-                            proto::encode_response_message(Response::Changes { site_id, changes })?;
+                            proto::encode_message(Response::Changes { site_id, changes })?;
                         let node = self.node.clone_box();
                         tokio::spawn(async move { node.app_call_reply(app_call.id(), resp).await });
                     }
@@ -584,7 +608,7 @@ pub(crate) async fn remote_status(
 }
 
 #[instrument(skip(conn), level = Level::DEBUG, ret, err)]
-pub async fn status(conn: &Connection) -> Result<(Vec<u8>, i64)> {
+pub async fn status(conn: &Connection) -> Result<NodeStatus> {
     let (site_id, db_version) = conn
         .call(|c| {
             c.query_row(
@@ -595,7 +619,7 @@ select crsql_site_id(), coalesce((select max(db_version) from crsql_changes wher
             )
         })
         .await?;
-    Ok((site_id, db_version))
+    Ok(NodeStatus{site_id, db_version, route: vec![]})
 }
 
 #[instrument(skip(conn), level = Level::DEBUG)]
