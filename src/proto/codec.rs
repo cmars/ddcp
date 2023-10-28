@@ -40,12 +40,12 @@ pub enum Response {
     },
 }
 
-pub trait Codec<B, R> {
-    type Builder = B;
-    type Reader = R;
+pub trait Encoder<T> {
+    fn encode(&self, builder: &mut T);
+}
 
-    fn encode(self, &mut builder: B);
-    fn decode(reader: &R) -> Result<Self>;
+pub trait Decoder<'a, T> {
+    fn decode(reader: &'a T) -> Result<Self> where Self: Sized;
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -60,31 +60,34 @@ pub struct Change {
     pub seq: i64,
 }
 
-pub fn encode_message<B>(codec: Codec<B, _>) -> Result<Vec<u8>> {
+pub fn encode_message<'a, T: capnp::traits::FromPointerBuilder<'a>>(encoder: &dyn Encoder<T>) -> Result<Vec<u8>> {
     let mut builder = message::Builder::new_default();
-    let mut request_builder = builder.get_root::<B>()?;
-    codec.encode(&mut request_builder);
+    let mut request_builder = builder.get_root::<'a, T>()?;
+    encoder.encode(&mut request_builder);
     Ok(serialize::write_message_segments_to_words(&builder))
 }
 
-pub fn decode_message<C>(msg_bytes: &[u8]) -> Result<C> {
+pub fn decode_message<T>(msg_bytes: &[u8]) -> Result<T> {
     let reader = serialize::read_message(msg_bytes, ReaderOptions::new())?;
-    let codec_reader = reader.get_root::<C::Reader>()?;
-    C::decode(&codec_reader)
+    let codec_reader = reader.get_root::<T>()?;
+    Decoder::decode::<T>(&codec_reader)?;
+    Ok(codec_reader)
 }
 
-impl Codec<request::Builder, request::Reader> for Request {
-    fn encode(self, builder: &mut request::Builder) {
+impl<'a> Encoder<request::Builder<'a>> for Request {
+    fn encode(&self, builder: &mut request::Builder<'a>) {
         match self {
             Request::Status => builder.set_status(()),
             Request::Changes { since_db_version } => builder
                 .reborrow()
                 .init_changes()
-                .set_since_version(since_db_version),
-        }
+                .set_since_version(*since_db_version),
+        };
     }
+}
 
-    fn decode(reader: &request::Reader) -> Result<Request> {
+impl<'a> Decoder<'a, request::Reader<'a>> for Request {
+    fn decode(reader: &'a request::Reader<'a>) -> Result<Request> {
         let which = reader.which()?;
         Ok(match which {
             request::Which::Status(_) => Request::Status,
@@ -96,16 +99,16 @@ impl Codec<request::Builder, request::Reader> for Request {
     }
 }
 
-impl Codec<response::Builder, response::Reader> for Response {
-    fn encode(self, builder: &mut response::Builder) {
-        Ok(match self {
+impl<'a> Encoder<response::Builder<'a>> for Response {
+    fn encode(&self, builder: &mut response::Builder<'a>) {
+        match self {
             Response::Changes { site_id, changes } => {
                 let mut build_changes = builder.reborrow().init_changes();
                 build_changes.set_site_id(&site_id);
                 let mut build_changes_changes =
                     build_changes.reborrow().init_changes(changes.len() as u32);
                 for i in 0..changes.len() {
-                    let mut build_change = build_changes_changes.reborrow().get(i as u32);
+                   let mut build_change = build_changes_changes.reborrow().get(i as u32);
                     build_change.set_table(changes[i].table.as_str().into());
                     build_change.set_pk(changes[i].pk.as_slice());
                     build_change.set_cid(changes[i].cid.as_str().into());
@@ -129,12 +132,14 @@ impl Codec<response::Builder, response::Reader> for Response {
             } => {
                 let mut build_status = builder.reborrow().init_status();
                 build_status.set_site_id(site_id.as_slice());
-                build_status.set_db_version(db_version);
+                build_status.set_db_version(*db_version);
             }
-        })
+        };
     }
+}
 
-    fn decode(reader: &response::Reader) -> Result<Response> {
+impl<'a> Decoder<'a, response::Reader<'a>> for Response {
+    fn decode(reader: &'a response::Reader<'a>) -> Result<Response> {
         let which = reader.which()?;
         Ok(match which {
             response::Which::Status(Ok(status)) => Response::Status {
@@ -183,15 +188,17 @@ pub struct NodeStatus {
     pub route: Vec<u8>,
 }
 
-impl Codec<node_status::Builder, node_status::Reader> for NodeStatus {
-    fn encode(self, builder: &mut node_status::Builder) {
+impl<'a> Encoder<node_status::Builder<'a>> for NodeStatus {
+    fn encode(&self, builder: &mut node_status::Builder<'a>) {
         let mut db_status_builder = builder.reborrow().init_db();
-        db_status_builder.set_site_id(self..site_id.as_slice());
-        db_status_builder.set_db_version(self..db_version);
-        builder.set_route(self..route.as_slice());
+        db_status_builder.set_site_id(self.site_id.as_slice());
+        db_status_builder.set_db_version(self.db_version);
+        builder.set_route(self.route.as_slice());
     }
+}
 
-    fn decode(reader: &node_status::Reader) -> Result<NodeStatus> {
+impl<'a> Decoder<'a, node_status::Reader<'a>> for NodeStatus {
+    fn decode(reader: &'a node_status::Reader<'a>) -> Result<NodeStatus> {
         let db_status = reader.get_db()?;
         Ok(NodeStatus {
             site_id: db_status.get_site_id()?.to_vec(),
@@ -207,14 +214,14 @@ mod tests {
 
     #[test]
     fn request_status() {
-        let msg_bytes = encode_message(Request::Status).expect("ok");
+        let msg_bytes = encode_message(&Request::Status).expect("ok");
         let decoded = decode_message::<Request>(&msg_bytes).expect("ok");
         assert_eq!(Request::Status, decoded);
     }
 
     #[test]
     fn response_status() {
-        let msg_bytes = encode_message(Response::Status {
+        let msg_bytes = encode_message(&Response::Status {
             site_id: "foo".as_bytes().to_vec(),
             db_version: 42,
         })
@@ -231,7 +238,7 @@ mod tests {
 
     #[test]
     fn request_changes() {
-        let msg_bytes = encode_message(Request::Changes {
+        let msg_bytes = encode_message(&Request::Changes {
             since_db_version: 42,
         })
         .expect("ok");
@@ -246,7 +253,7 @@ mod tests {
 
     #[test]
     fn response_changes_empty() {
-        let msg_bytes = encode_message(Response::Changes {
+        let msg_bytes = encode_message(&Response::Changes {
             site_id: "foo".as_bytes().to_vec(),
             changes: vec![],
         })
@@ -285,7 +292,7 @@ mod tests {
                 seq: 1111,
             },
         ];
-        let msg_bytes = encode_message(Response::Changes {
+        let msg_bytes = encode_message(&Response::Changes {
             site_id: "foo".as_bytes().to_vec(),
             changes: changes.clone(),
         })
