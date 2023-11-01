@@ -5,7 +5,7 @@ use tracing_subscriber::prelude::*;
 
 use ddcp::{
     cli::{Cli, Commands, RemoteArgs, RemoteCommands},
-    other_err, Error, Result, DDCP,
+    other_err, Error, Result, //DDCP,
 };
 
 #[tokio::main]
@@ -26,6 +26,8 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    todo!();
+    /* 
     let cli = Cli::parse();
 
     let (db_file, state_dir, ext_file) = (cli.db_file()?, cli.state_dir()?, cli.ext_file()?);
@@ -105,4 +107,5 @@ async fn run() -> Result<()> {
 
     app.cleanup().await?;
     result
+    */
 }

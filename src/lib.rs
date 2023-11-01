@@ -2,7 +2,6 @@ use std::{sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
 use rusqlite::{params, types::Value, OptionalExtension};
-use status_manager::StatusManager;
 use tokio::{
     select, signal,
     task::{JoinHandle, JoinSet},
@@ -12,20 +11,25 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    RouteId, Sequencing, Target, ValueSubkey, VeilidUpdate, SharedSecret,
+    RouteId, Sequencing, SharedSecret, Target, ValueSubkey, VeilidUpdate,
 };
 
 pub mod cli;
 mod error;
+#[cfg(feature="todo")]
 mod node;
 mod proto;
 mod store;
+#[cfg(feature="todo")]
+use status_manager::StatusManager;
 pub mod veilid_config;
 
 pub use error::{other_err, Error, Result};
+#[cfg(feature="todo")]
 pub use node::{Node, VeilidNode};
-use proto::{Request, Response, NodeStatus};
+use proto::{NodeStatus, Request, Response};
 
+#[cfg(feature="todo")]
 pub struct DDCP {
     conn: Connection,
     node: Box<dyn Node>,
@@ -46,6 +50,7 @@ pub(crate) const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
 static LOCAL_TRACKER_PERIOD: Duration = Duration::from_secs(60);
 static REMOTE_TRACKER_PERIOD: Duration = Duration::from_secs(60);
 
+#[cfg(feature="todo")]
 impl DDCP {
     pub async fn new(db_path: Option<&str>, state_path: &str, ext_path: &str) -> Result<DDCP> {
         let conn = DDCP::new_connection(db_path, ext_path).await?;
@@ -128,9 +133,7 @@ impl DDCP {
             Some(phrase) => {
                 todo!("import key")
             }
-            None => {
-                self.ensure_peer_secret()?
-            }
+            None => self.ensure_peer_secret()?,
         });
 
         // Load or create DHT key
@@ -210,12 +213,12 @@ where site_id = ? and event = ?",
             .node
             .app_call(
                 Target::PrivateRoute(route_id),
-                proto::encode_message(Request::Changes {
+                proto::encode_message(&Request::Changes {
                     since_db_version: tracked_version,
                 })?,
             )
             .await?;
-        let resp = proto::decode_message::<Response>(msg_bytes.as_slice())?;
+        let resp = proto::decode_message::<proto::response::Reader, proto::Response>(msg_bytes.as_slice())?;
 
         if let Response::Changes { site_id, changes } = resp {
             self.merge(site_id.clone(), changes).await?;
@@ -438,17 +441,18 @@ on conflict do update set version = max(version, excluded.version)",
     ) -> Result<bool> {
         match update {
             VeilidUpdate::AppCall(app_call) => {
-                let request = match proto::decode_message::<Request>(app_call.message()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(err = format!("{:?}", e), "Invalid app_call request");
-                        return Ok(false);
-                    }
-                };
+                let request =
+                    match proto::decode_message::<proto::request::Reader, proto::Request>(app_call.message()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(err = format!("{:?}", e), "Invalid app_call request");
+                            return Ok(false);
+                        }
+                    };
                 match request {
                     Request::Status => {
                         let (site_id, db_version) = status(&self.conn).await?;
-                        let resp = proto::encode_message(Response::Status {
+                        let resp = proto::encode_message(&Response::Status {
                             site_id,
                             db_version,
                         })?;
@@ -457,8 +461,7 @@ on conflict do update set version = max(version, excluded.version)",
                     }
                     Request::Changes { since_db_version } => {
                         let (site_id, changes) = changes(&self.conn, since_db_version).await?;
-                        let resp =
-                            proto::encode_message(Response::Changes { site_id, changes })?;
+                        let resp = proto::encode_message(&Response::Changes { site_id, changes })?;
                         let node = self.node.clone_box();
                         tokio::spawn(async move { node.app_call_reply(app_call.id(), resp).await });
                     }
@@ -561,6 +564,7 @@ on conflict do update set version = max(version, excluded.version)",
     }
 }
 
+#[cfg(feature="todo")]
 #[instrument(skip(node), level = Level::DEBUG, err)]
 pub(crate) async fn remote_status(
     node: Box<dyn Node>,
@@ -607,6 +611,7 @@ pub(crate) async fn remote_status(
     })
 }
 
+#[cfg(feature="todo")]
 #[instrument(skip(conn), level = Level::DEBUG, ret, err)]
 pub async fn status(conn: &Connection) -> Result<NodeStatus> {
     let (site_id, db_version) = conn
@@ -619,9 +624,14 @@ select crsql_site_id(), coalesce((select max(db_version) from crsql_changes wher
             )
         })
         .await?;
-    Ok(NodeStatus{site_id, db_version, route: vec![]})
+    Ok(NodeStatus {
+        site_id,
+        db_version,
+        route: vec![],
+    })
 }
 
+#[cfg(feature="todo")]
 #[instrument(skip(conn), level = Level::DEBUG)]
 pub async fn changes(
     conn: &Connection,

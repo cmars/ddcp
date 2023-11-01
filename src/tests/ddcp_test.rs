@@ -9,7 +9,7 @@ use super::mocks::setup;
 async fn test_status_changes() {
     let (mut alice, alice_conn, _) = setup().await;
 
-    let addr = alice.init().await.expect("init");
+    let addr = alice.init(None).await.expect("init");
     assert_eq!(addr, "VLD0:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
 
     let (push_addr, push_site_id, version) = alice.push().await.expect("push");
@@ -40,8 +40,8 @@ async fn test_sync_changes() {
     let (mut alice, alice_conn, _) = setup().await;
     let (mut bob, bob_conn, _) = setup().await;
 
-    let _ = alice.init().await.expect("init");
-    let _ = bob.init().await.expect("init");
+    let _ = alice.init(None).await.expect("init");
+    let _ = bob.init(None).await.expect("init");
 
     let alice_points = vec![
         (1, 2, "👾".to_string()),

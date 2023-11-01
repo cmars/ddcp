@@ -4,7 +4,7 @@ use flume::Receiver;
 use tracing::{info, warn};
 use veilid_core::{
     CryptoKind, DHTRecordDescriptor, DHTSchema, KeyPair, OperationId, RouteId, RoutingContext,
-    Target, TypedKey, ValueData, ValueSubkey, VeilidAPIResult, VeilidUpdate, SharedSecret,
+    Target, TypedKey, ValueData, ValueSubkey, VeilidAPIResult, VeilidUpdate, SharedSecret, CRYPTO_KIND_VLD0,
 };
 
 use crate::{
@@ -90,6 +90,7 @@ impl VeilidNode {
     }
 }
 
+#[cfg(feature="todo")]
 #[async_trait]
 impl Node for VeilidNode {
     fn clone_box(&self) -> Box<dyn Node> {
