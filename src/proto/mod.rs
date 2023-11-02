@@ -1,6 +1,5 @@
-mod codec;
-mod crypto;
-mod ddcp_capnp;
+pub mod codec;
+pub mod crypto;
 
-pub use codec::*;
+mod ddcp_capnp;
 pub use ddcp_capnp::{node_status, request, response};

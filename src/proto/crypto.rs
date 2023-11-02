@@ -2,14 +2,14 @@ use std::array::TryFromSliceError;
 
 use veilid_core::{CryptoSystemVersion, Nonce, SharedSecret, VeilidAPIError, NONCE_LENGTH};
 
-use crate::proto;
+use crate::proto::codec;
 
-use proto::{Decodable, Encodable};
+use codec::{Decodable, Encodable};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("{0}")]
-    Proto(#[from] proto::Error),
+    Proto(#[from] codec::Error),
     #[error("{0}")]
     VeilidAPI(#[from] VeilidAPIError),
     #[error("{0}")]
@@ -50,11 +50,9 @@ impl Crypto {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use veilid_core::CRYPTO_KIND_VLD0;
 
-    use crate::proto::Request;
+    use crate::proto::codec::Request;
     use crate::tests::api::{setup_api, teardown_api};
 
     use super::*;

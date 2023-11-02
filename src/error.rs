@@ -13,7 +13,7 @@ pub enum Error {
     #[error("veilid api error: {0}")]
     VeilidAPI(#[from] VeilidAPIError),
     #[error("protocol error: {0}")]
-    Protocol(#[from] proto::Error),
+    Protocol(#[from] proto::codec::Error),
     #[error("utf-8 encoding error: {0}")]
     Utf8(#[from] std::str::Utf8Error),
     #[error("other: {0}")]

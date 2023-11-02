@@ -27,7 +27,7 @@ pub mod veilid_config;
 pub use error::{other_err, Error, Result};
 #[cfg(feature="todo")]
 pub use node::{Node, VeilidNode};
-use proto::{NodeStatus, Request, Response};
+use proto::codec::{NodeStatus, Request, Response};
 
 #[cfg(feature="todo")]
 pub struct DDCP {
