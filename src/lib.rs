@@ -16,6 +16,7 @@ use veilid_core::{
 
 pub mod cli;
 mod error;
+mod ident;
 #[cfg(feature="todo")]
 mod node;
 mod proto;

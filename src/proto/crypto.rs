@@ -69,7 +69,7 @@ mod tests {
         let msg_bytes = crypto.encode(Request::Status).expect("encode");
         let decoded = crypto.decode::<Request>(&msg_bytes).expect("ok");
         assert_eq!(Request::Status, decoded);
-        teardown_api(api);
+        teardown_api(api).await;
     }
 
 }
