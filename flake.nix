@@ -2,7 +2,9 @@
   description = "ddcp";
 
   inputs = {
-    nixpkgs.url = "nixpkgs";
+    # NixOS 23.11 has recent enough versions of capnproto and protobuf to
+    # develop on Veilid.
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-23.11";
 
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -22,54 +24,11 @@
         };
 
         arch = "x86_64";  # TODO: derive this from system?
-        capnprotoVersion = "1.0.1";
-        protobufVersion = "24.3";
-
-        capnproto_veilid = (with pkgs; stdenv.mkDerivation {
-          pname = "capnproto";
-          version = "${capnprotoVersion}";
-          src = fetchzip {
-            url = "https://capnproto.org/capnproto-c++-${capnprotoVersion}.tar.gz";
-            hash = "sha256-9y1T1ddGEK8X8qjnh5ZDfqgyPagYghJG+EAwdT83VJs=";
-          };
-          nativeBuildInputs = [
-            autoconf
-            automake
-            m4
-            gnumake
-            clang
-          ];
-          buildPhase = "./configure --without-openssl --prefix=$out && make";
-          installPhase = ''
-            mkdir -p $out/bin
-            make -C $TMP/source install prefix=$out
-          '';
-        });
-
-        protobuf_veilid = (with pkgs; stdenv.mkDerivation {
-          pname = "protobuf";
-          version = "${protobufVersion}";
-          src = fetchzip {
-            stripRoot = false;
-            url = "https://github.com/protocolbuffers/protobuf/releases/download/v${protobufVersion}/protoc-${protobufVersion}-linux-${arch}.zip";
-            hash = "sha256-QrJi/s6DEPbX/1k64UFJxzq7SUwapDjuWU5UNrAFMlI=";
-          };
-          buildPhase = ''
-            chmod +x bin/*
-          '';
-          installPhase = ''
-            mkdir -p $out/bin $out/include
-            cp -r $TMP/source/bin/* $out/bin
-            cp -r $TMP/source/include/* $out/include
-          '';
-        });
 
       in {
 
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            capnproto_veilid
-            protobuf_veilid
           ] ++ (with pkgs; [
             cargo
             cargo-watch
@@ -81,6 +40,8 @@
             llvmPackages.libclang
             gnumake
             sqlite
+            capnproto
+            protobuf
           ]);
 
           LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";

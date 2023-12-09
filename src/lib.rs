@@ -105,9 +105,9 @@ impl DDCP {
         api.attach().await?;
 
         let routing_context = api
-            .routing_context()
+            .routing_context()?
             .with_sequencing(Sequencing::EnsureOrdered)
-            .with_privacy()?;
+            .with_default_safety()?;
 
         Ok(VeilidNode::new(routing_context, updates))
     }
