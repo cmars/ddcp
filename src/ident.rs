@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
+use veilid_core::FromStr;
 use veilid_core::{
-    CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, RouteId, RoutingContext,
-    SharedSecret, TableDB, TableStore, TypedKey, TypedKeyPair, ValueSubkey, VeilidAPI,
-    CRYPTO_KIND_VLD0,
+    CryptoSystemVLD0, CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, PublicKey, RouteId,
+    RoutingContext, SharedSecret, TableDB, TableStore, TypedKey, TypedKeyPair, ValueSubkey,
+    VeilidAPI, CRYPTO_KIND_VLD0,
 };
 
 use crate::{error::Result, other_err};
@@ -21,7 +22,7 @@ const TABLE_STORE_LOCAL_COLUMN_MEMBER_KEYPAIR: u32 = 3;
 
 const TABLE_STORE_REMOTES_N_COLUMNS: u32 = 3;
 const TABLE_STORE_REMOTES_COLUMN_DHT_KEY: u32 = 0;
-const TABLE_STORE_REMOTES_COLUMN_PUBLIC_KEY: u32 = 1;
+const TABLE_STORE_REMOTES_COLUMN_IDENT_KEY: u32 = 1;
 
 pub struct Sovereign {
     shared_secret: SharedSecret,
@@ -167,7 +168,7 @@ impl Sovereign {
 pub struct Peer {
     name: String,
     dht_public_key: TypedKey,
-    app_public_key: TypedKey,
+    ident_public_key: TypedKey,
 
     dht: Option<DHTRecordDescriptor>,
     route_id: Option<RouteId>,
@@ -179,6 +180,37 @@ impl Peer {
             .open("ddcp_conclave_remotes", TABLE_STORE_REMOTES_N_COLUMNS)
             .await?;
         Ok(db)
+    }
+
+    pub async fn new(
+        api: &VeilidAPI,
+        name: &str,
+        dht_public_key: &str,
+        ident_public_key: &str,
+    ) -> Result<Peer> {
+        let ts = api.table_store()?;
+        let db = Self::open_db(&ts).await?;
+        let db_key = name.as_bytes().to_vec();
+
+        // Parse and store dht key
+        let dht_key = TypedKey::from_str(dht_public_key)?;
+        db.store_json(
+            TABLE_STORE_REMOTES_COLUMN_DHT_KEY,
+            db_key.as_slice(),
+            &dht_key,
+        )
+        .await?;
+
+        // Parse and store ident key
+        let ident_key = TypedKey::from_str(ident_public_key)?;
+        db.store_json(
+            TABLE_STORE_REMOTES_COLUMN_IDENT_KEY,
+            db_key.as_slice(),
+            &ident_key,
+        )
+        .await?;
+
+        Self::load(name, &db, &db_key).await
     }
 
     pub async fn load_all(api: &VeilidAPI) -> Result<HashMap<String, Peer>> {
@@ -197,19 +229,19 @@ impl Peer {
         Ok(remotes)
     }
 
-    async fn load(name: &str, db: &TableDB, key: &Vec<u8>) -> Result<Peer> {
+    async fn load(name: &str, db: &TableDB, db_key: &Vec<u8>) -> Result<Peer> {
         let dht_public_key = db
-            .load_json::<TypedKey>(TABLE_STORE_REMOTES_COLUMN_DHT_KEY, key)
+            .load_json::<TypedKey>(TABLE_STORE_REMOTES_COLUMN_DHT_KEY, db_key)
             .await?
             .ok_or(other_err("remote peer missing dht key"))?;
-        let public_key = db
-            .load_json::<TypedKey>(TABLE_STORE_REMOTES_COLUMN_PUBLIC_KEY, key)
+        let ident_public_key = db
+            .load_json::<TypedKey>(TABLE_STORE_REMOTES_COLUMN_IDENT_KEY, db_key)
             .await?
             .ok_or(other_err("remote peer missing public key"))?;
         Ok(Peer {
             name: name.to_owned(),
             dht_public_key,
-            app_public_key: public_key,
+            ident_public_key,
             dht: None,
             route_id: None,
         })
@@ -311,7 +343,6 @@ impl Conclave {
     }
 
     pub async fn set_peer(&mut self, mut peer: Peer) -> Result<()> {
-        peer.refresh(&self.routing_context).await?;
         self.remotes.insert(peer.name.clone(), peer);
         Ok(())
     }
@@ -333,17 +364,32 @@ impl Conclave {
 mod tests {
     use veilid_core::Sequencing;
 
-    use crate::tests::api::{setup_api, teardown_api};
+    use crate::tests::api::{setup_api, teardown_api, TEST_API_MUTEX};
 
     use super::*;
 
     #[tokio::test]
     async fn basic() {
+        let _lock = TEST_API_MUTEX.lock().expect("lock");
+
         let api = setup_api().await;
         let routing_context = api
-            .routing_context().with_sequencing(Sequencing::PreferOrdered).with_privacy().expect("ok");
-        let ccl = Conclave::new(routing_context).await.expect("ok");
+            .routing_context().expect("routing context")
+            .with_sequencing(Sequencing::PreferOrdered)
+            .with_default_safety()
+            .expect("ok");
+        let mut ccl = Conclave::new(routing_context).await.expect("ok");
         assert_eq!(ccl.peers().len(), 0);
+        let peer = Peer::new(
+            &api,
+            "bob",
+            "VLD0:7lxDEabK_qgjbe38RtBa3IZLrud84P6NhGP-pRTZzdQ",
+            "VLD0:7lxDEabK_qgjbe38RtBa3IZLrud84P6NhGP-pRTZzdQ",
+        )
+        .await
+        .expect("new peer");
+        ccl.set_peer(peer).await.expect("set peer");
+        assert_eq!(ccl.peers().len(), 1);
         ccl.close().await.expect("ok");
         teardown_api(api).await;
     }

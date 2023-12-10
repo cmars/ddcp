@@ -835,6 +835,7 @@ dependencies = [
  "clap",
  "exec",
  "flume",
+ "once_cell",
  "rand",
  "rusqlite",
  "thiserror",

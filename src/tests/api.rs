@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use once_cell::sync::Lazy;
 
 use veilid_core::tests::common::test_veilid_config::{
     get_block_store_path, get_certfile_path, get_keyfile_path, get_protected_store_path,
@@ -7,6 +9,8 @@ use veilid_core::tests::common::test_veilid_config::{
 use veilid_core::{
     api_startup, ConfigCallbackReturn, FourCC, TypedKeyGroup, TypedSecretGroup, VeilidAPI,
 };
+
+pub(crate) static TEST_API_MUTEX: Lazy<Mutex<()>> = Lazy::new(Mutex::default);
 
 pub async fn setup_api() -> VeilidAPI {
     api_startup(Arc::new(|_| {}), Arc::new(config_callback))

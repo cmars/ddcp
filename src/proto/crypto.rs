@@ -53,12 +53,14 @@ mod tests {
     use veilid_core::CRYPTO_KIND_VLD0;
 
     use crate::proto::codec::Request;
-    use crate::tests::api::{setup_api, teardown_api};
+    use crate::tests::api::{setup_api, teardown_api, TEST_API_MUTEX};
 
     use super::*;
 
     #[tokio::test]
     async fn roundtrip() {
+        let _lock = TEST_API_MUTEX.lock().expect("lock");
+
         let api = setup_api().await;
         let crypto_system = api
             .crypto()
