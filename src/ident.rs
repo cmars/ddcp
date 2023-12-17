@@ -18,17 +18,13 @@ const TABLE_STORE_LOCAL_N_COLUMNS: u32 = 5;
 const TABLE_STORE_LOCAL_COLUMN_SHARED_SECRET: u32 = 0;
 const TABLE_STORE_LOCAL_COLUMN_DHT_KEY: u32 = 1;
 const TABLE_STORE_LOCAL_COLUMN_DHT_OWNER_KEYPAIR: u32 = 2;
-const TABLE_STORE_LOCAL_COLUMN_MEMBER_KEYPAIR: u32 = 3;
 
 const TABLE_STORE_REMOTES_N_COLUMNS: u32 = 3;
 const TABLE_STORE_REMOTES_COLUMN_DHT_KEY: u32 = 0;
-const TABLE_STORE_REMOTES_COLUMN_IDENT_KEY: u32 = 1;
 
 pub struct Sovereign {
-    shared_secret: SharedSecret,
     dht_key: TypedKey,
     dht_owner_keypair: CryptoTyped<KeyPair>,
-    member_keypair: CryptoTyped<KeyPair>,
 
     dht: Option<DHTRecordDescriptor>,
     route_id: Option<RouteId>,
@@ -51,10 +47,6 @@ impl Sovereign {
             .get(CRYPTO_KIND_VLD0)
             .ok_or(other_err("missing VLD0 cryptosystem"))?;
 
-        // generate keys
-        let shared_secret = crypto.random_shared_secret();
-        let member_keypair = crypto.generate_keypair();
-
         // create DHT
         let new_dht = routing_context
             .create_dht_record(
@@ -76,20 +68,12 @@ impl Sovereign {
             .await?;
 
         // write these to db
-        db.store_json(TABLE_STORE_LOCAL_COLUMN_SHARED_SECRET, &[], &shared_secret)
-            .await?;
         db.store_json(TABLE_STORE_LOCAL_COLUMN_DHT_KEY, &[], new_dht.key())
             .await?;
         db.store_json(
             TABLE_STORE_LOCAL_COLUMN_DHT_OWNER_KEYPAIR,
             &[],
             &dht_owner_keypair,
-        )
-        .await?;
-        db.store_json(
-            TABLE_STORE_LOCAL_COLUMN_MEMBER_KEYPAIR,
-            &[],
-            &member_keypair,
         )
         .await?;
 
@@ -102,12 +86,6 @@ impl Sovereign {
     pub async fn load(routing_context: &RoutingContext) -> Result<Option<Sovereign>> {
         let ts = routing_context.api().table_store()?;
         let db = Self::open_db(&ts).await?;
-        let Some(shared_secret) = db
-            .load_json::<SharedSecret>(TABLE_STORE_LOCAL_COLUMN_SHARED_SECRET, &[])
-            .await?
-        else {
-            return Ok(None);
-        };
         let Some(dht_key) = db
             .load_json::<TypedKey>(TABLE_STORE_LOCAL_COLUMN_DHT_KEY, &[])
             .await?
@@ -120,21 +98,13 @@ impl Sovereign {
         else {
             return Ok(None);
         };
-        let Some(member_keypair) = db
-            .load_json::<TypedKeyPair>(TABLE_STORE_LOCAL_COLUMN_MEMBER_KEYPAIR, &[])
-            .await?
-        else {
-            return Ok(None);
-        };
 
         let dht = routing_context
             .open_dht_record(dht_key.clone(), Some(dht_owner_keypair.value.clone()))
             .await?;
         Ok(Some(Sovereign {
-            shared_secret,
             dht_key,
             dht_owner_keypair,
-            member_keypair,
             dht: Some(dht),
             route_id: None,
         }))
@@ -168,7 +138,6 @@ impl Sovereign {
 pub struct Peer {
     name: String,
     dht_public_key: TypedKey,
-    ident_public_key: TypedKey,
 
     dht: Option<DHTRecordDescriptor>,
     route_id: Option<RouteId>,
@@ -186,7 +155,6 @@ impl Peer {
         api: &VeilidAPI,
         name: &str,
         dht_public_key: &str,
-        ident_public_key: &str,
     ) -> Result<Peer> {
         let ts = api.table_store()?;
         let db = Self::open_db(&ts).await?;
@@ -198,15 +166,6 @@ impl Peer {
             TABLE_STORE_REMOTES_COLUMN_DHT_KEY,
             db_key.as_slice(),
             &dht_key,
-        )
-        .await?;
-
-        // Parse and store ident key
-        let ident_key = TypedKey::from_str(ident_public_key)?;
-        db.store_json(
-            TABLE_STORE_REMOTES_COLUMN_IDENT_KEY,
-            db_key.as_slice(),
-            &ident_key,
         )
         .await?;
 
@@ -234,14 +193,9 @@ impl Peer {
             .load_json::<TypedKey>(TABLE_STORE_REMOTES_COLUMN_DHT_KEY, db_key)
             .await?
             .ok_or(other_err("remote peer missing dht key"))?;
-        let ident_public_key = db
-            .load_json::<TypedKey>(TABLE_STORE_REMOTES_COLUMN_IDENT_KEY, db_key)
-            .await?
-            .ok_or(other_err("remote peer missing public key"))?;
         Ok(Peer {
             name: name.to_owned(),
             dht_public_key,
-            ident_public_key,
             dht: None,
             route_id: None,
         })
@@ -383,7 +337,6 @@ mod tests {
         let peer = Peer::new(
             &api,
             "bob",
-            "VLD0:7lxDEabK_qgjbe38RtBa3IZLrud84P6NhGP-pRTZzdQ",
             "VLD0:7lxDEabK_qgjbe38RtBa3IZLrud84P6NhGP-pRTZzdQ",
         )
         .await
