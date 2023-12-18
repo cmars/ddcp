@@ -187,6 +187,12 @@ and site_id is null",
 mod tests {
     use super::*;
 
+    async fn new_db() -> DB {
+        DB::new(None, "target/debug/crsqlite")
+            .await
+            .expect("new db")
+    }
+
     #[tokio::test]
     async fn version_advances() {
         let test_points: Vec<(i32, i32, String)> = vec![
@@ -196,9 +202,7 @@ mod tests {
             (5, 8, "🪣".to_string()),
         ];
 
-        let db = DB::new(None, "target/debug/crsqlite")
-            .await
-            .expect("new db");
+        let db = new_db().await;
         let (site_id, version) = db.status().await.expect("status");
         assert_eq!(site_id.len(), 16, "site_id is expected length");
         assert_ne!(site_id.as_slice(), [0; 16], "site_id is not all zeroes");
@@ -229,5 +233,88 @@ mod tests {
         assert_eq!(version_2, 4i64);
 
         db.close().await.expect("close db");
+    }
+
+    #[tokio::test]
+    async fn merge_changes() {
+        // Initialize two databases
+        let db_1 = new_db().await;
+        let db_2 = new_db().await;
+
+        let (site_id_1, version_1) = db_1.status().await.expect("status");
+        let (site_id_2, version_2) = db_2.status().await.expect("status");
+
+        // Make changes in the first database
+        db_1.conn
+            .call(move |conn| {
+                conn.execute(
+                    "create table canvas (x integer, y integer, value text, primary key (x, y));",
+                    [],
+                )?;
+                conn.query_row("select crsql_as_crr('canvas');", [], |_| Ok(()))?;
+
+                conn.execute(
+                    "insert into canvas (x, y, value) values (?, ?, ?)",
+                    params![1, 1, "🌟"],
+                )?;
+                conn.execute(
+                    "insert into canvas (x, y, value) values (?, ?, ?)",
+                    params![2, 2, "🚀"],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("make changes in db1");
+
+        // Create table in second database. Table schema needs to be the same in
+        // order to apply changes.
+        db_2.conn
+            .call(move |conn| {
+                conn.execute(
+                    "create table canvas (x integer, y integer, value text, primary key (x, y));",
+                    [],
+                )?;
+                conn.query_row("select crsql_as_crr('canvas');", [], |_| Ok(()))?;
+                Ok(())
+            })
+            .await
+            .expect("create table in db_2");
+
+        // Merge changes into the second database
+        let changes_1 = db_1
+            .changes(version_1)
+            .await
+            .expect("get changes from db_1")
+            .1;
+        let merged_version = db_2
+            .merge(site_id_1, changes_1)
+            .await
+            .expect("merge changes into db_2");
+
+        // merged_version is db_1's merged version, as tracked by db_2
+        assert_eq!(db_1.status().await.expect("db_1 status").1, merged_version);
+
+        let result = db_2
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare("select x, y, value from canvas order by x, y")?;
+                let mut result = vec![];
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    result.push((
+                        row.get::<usize, i32>(0)?,
+                        row.get::<usize, i32>(1)?,
+                        row.get::<usize, String>(2)?,
+                    ));
+                }
+                Ok(result)
+            })
+            .await
+            .expect("contents of db_2");
+        assert_eq!(result, vec![(1, 1, "🌟".to_string()), (2, 2, "🚀".to_string()),]);
+
+        // Close databases
+        db_1.close().await.expect("close db_1");
+        db_2.close().await.expect("close db_2");
     }
 }
