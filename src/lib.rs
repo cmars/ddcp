@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
+use ident::{Conclave, Peer};
 use rusqlite::{params, types::Value, OptionalExtension};
 use tokio::{
     select, signal,
@@ -11,42 +12,25 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    RouteId, Sequencing, SharedSecret, Target, ValueSubkey, VeilidUpdate,
+    RouteId, Sequencing, SharedSecret, Target, ValueSubkey, VeilidUpdate, RoutingContext,
 };
 
 pub mod cli;
+mod db;
 mod error;
 mod ident;
-#[cfg(feature="todo")]
-mod node;
 mod proto;
-mod store;
-#[cfg(feature="todo")]
-use status_manager::StatusManager;
 pub mod veilid_config;
 
 pub use error::{other_err, Error, Result};
-#[cfg(feature="todo")]
-pub use node::{Node, VeilidNode};
-use proto::codec::{NodeStatus, Request, Response};
 
 #[cfg(feature="todo")]
 pub struct DDCP {
     conn: Connection,
-    node: Box<dyn Node>,
-    dht_keypair: Option<DHTRecordDescriptor>,
-    peer_secret: Option<SharedSecret>,
+    routing_context: RoutingContext,
+    conclave: Conclave,
+    updates: Receiver<VeilidUpdate>,
 }
-
-pub(crate) const LOCAL_KEYPAIR_NAME: &str = "__local";
-
-pub(crate) const DHT_SUBKEY_COUNT: u16 = 3;
-pub(crate) const SUBKEY_SITE_ID: ValueSubkey = 0;
-pub(crate) const SUBKEY_DB_VERSION: ValueSubkey = 1;
-pub(crate) const SUBKEY_PRIVATE_ROUTE: ValueSubkey = 2;
-
-pub(crate) const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
-pub(crate) const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
 
 static LOCAL_TRACKER_PERIOD: Duration = Duration::from_secs(60);
 static REMOTE_TRACKER_PERIOD: Duration = Duration::from_secs(60);
@@ -55,25 +39,16 @@ static REMOTE_TRACKER_PERIOD: Duration = Duration::from_secs(60);
 impl DDCP {
     pub async fn new(db_path: Option<&str>, state_path: &str, ext_path: &str) -> Result<DDCP> {
         let conn = DDCP::new_connection(db_path, ext_path).await?;
-        let node = DDCP::new_veilid_node(state_path).await?;
+        let (routing_context, updates) = DDCP::new_routing_context(state_path).await?;
         Ok(DDCP {
             conn,
-            node,
-            dht_keypair: None,
-            peer_secret: None,
+            conclave: Conclave::new(routing_context.clone()),
+            routing_context,
+            updates,
         })
     }
 
-    pub(crate) fn new_conn_node(conn: Connection, node: Box<dyn Node>) -> DDCP {
-        DDCP {
-            conn,
-            node,
-            dht_keypair: None,
-            peer_secret: None,
-        }
-    }
-
-    pub(crate) async fn new_connection(
+    async fn new_connection(
         db_path: Option<&str>,
         ext_path: &str,
     ) -> Result<Connection> {
@@ -95,7 +70,7 @@ impl DDCP {
         Ok(conn)
     }
 
-    async fn new_veilid_node(state_path: &str) -> Result<Box<dyn Node>> {
+    async fn new_routing_context(state_path: &str) -> Result<(RoutingContext, Receiver<VeilidUpdate>)> {
         // Veilid API state channel
         let (node_sender, updates): (
             Sender<veilid_core::VeilidUpdate>,
@@ -118,41 +93,39 @@ impl DDCP {
             .routing_context()?
             .with_sequencing(Sequencing::EnsureOrdered)
             .with_default_safety()?;
-
-        Ok(VeilidNode::new(routing_context, updates))
+        Ok((routing_context, updates))
     }
 
     #[instrument(skip(self), level = Level::INFO, ret, err)]
     pub async fn wait_for_network(&self) -> Result<()> {
-        self.node.wait_for_network().await
-    }
-
-    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub async fn init(&mut self, mnemonic: Option<String>) -> Result<String> {
-        // Load or create peer secret
-        self.peer_secret = Some(match mnemonic {
-            Some(phrase) => {
-                todo!("import key")
-            }
-            None => self.ensure_peer_secret()?,
-        });
-
-        // Load or create DHT key
-        let local_dht = self.ensure_dht_keypair(LOCAL_KEYPAIR_NAME).await?;
-        let addr = local_dht.key().to_string();
-        self.dht_keypair = Some(local_dht);
-        Ok(addr)
-    }
-
-    fn ensure_peer_secret(&self) -> Result<SharedSecret> {
-        Ok(match self.node.store().load_peer_secret().await? {
-            Some(secret) => secret,
-            None => {
-                let secret = self.node.generate_peer_secret()?;
-                self.node.store().store_peer_secret(secret).await?;
-                secret
-            }
-        })
+        // Wait for network to be up
+        loop {
+            let res = self.updates.recv_async().await;
+            match res {
+                Ok(VeilidUpdate::Attachment(attachment)) => {
+                    if attachment.public_internet_ready {
+                        info!(
+                            state = attachment.state.to_string(),
+                            public_internet_ready = attachment.public_internet_ready,
+                            "Connected"
+                        );
+                        break;
+                    }
+                    info!(
+                        state = attachment.state.to_string(),
+                        public_internet_ready = attachment.public_internet_ready,
+                        "Waiting for network"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(Error::Other(e.to_string()));
+                }
+            };
+        }
+        // Refresh DHT state
+        self.conclave.refresh().await?;
+        Ok(())
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
@@ -296,47 +269,9 @@ on conflict do update set version = max(version, excluded.version)",
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub(crate) async fn ensure_dht_keypair(&self, name: &str) -> Result<DHTRecordDescriptor> {
-        let dht = match self.node.store().load_local_keypair(name).await? {
-            Some((key, owner)) => self.node.open_dht_record(key, Some(owner)).await?,
-            None => {
-                let new_dht = self
-                    .node
-                    .create_dht_record(
-                        DHTSchema::DFLT(DHTSchemaDFLT {
-                            o_cnt: DHT_SUBKEY_COUNT,
-                        }),
-                        None,
-                    )
-                    .await?;
-                self.node
-                    .store()
-                    .store_local_keypair(
-                        name,
-                        new_dht.key(),
-                        KeyPair::new(
-                            new_dht.owner().to_owned(),
-                            new_dht.owner_secret().unwrap().to_owned(),
-                        ),
-                    )
-                    .await?;
-                new_dht
-            }
-        };
-        Ok(dht)
-    }
-
-    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn cleanup(self) -> Result<()> {
-        let remotes = self.remotes().await?;
-        for (name, _) in remotes.iter() {
-            if let (Some(remote_dht), _) = self.node.store().load_remote(name).await? {
-                let _ = self.node.close_dht_record(remote_dht).await;
-            }
-        }
-
-        // Shut down Veilid node
-        self.node.shutdown(self.dht_keypair).await?;
+        // Release DHT resources
+        self.conclave.close()?;
 
         // Finalize cr-sqlite db
         self.conn
@@ -352,21 +287,20 @@ on conflict do update set version = max(version, excluded.version)",
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
-        let key = CryptoTyped::from_str(addr.as_str())?;
-        self.node.store().store_remote_key(&name, &key).await?;
+        let peer = Peer::new(&self.routing_context.api(), name.as_str(), addr.as_str()).await?;
+        self.conclave.set_peer(peer).await?;
         Ok(())
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn remote_remove(&self, name: String) -> Result<()> {
-        self.node.store().remove_remote(name).await?;
-        Ok(())
+        todo!(); // TODO: need to add Conclave::remove_peer
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
-        let result = self.node.store().remotes().await?;
-        Ok(result)
+        todo!(); // TODO: implement peer getters like this:
+        //self.conclave.peers().map(|peer| {(peer.name(), peer.dht_public_key.to_string())})
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
