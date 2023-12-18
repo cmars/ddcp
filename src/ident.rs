@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
-use veilid_core::FromStr;
 use veilid_core::{
-    CryptoSystemVLD0, CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, PublicKey, RouteId,
-    RoutingContext, SharedSecret, TableDB, TableStore, TypedKey, TypedKeyPair, ValueSubkey,
+    CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, RouteId,
+    RoutingContext, TableDB, TableStore, TypedKey, TypedKeyPair, ValueSubkey,
     VeilidAPI, CRYPTO_KIND_VLD0,
 };
+use veilid_core::{FromStr, Target};
 
+use crate::proto::codec::{ChangesResponse, Response, StatusResponse, Request};
+use crate::proto::crypto::Crypto;
 use crate::{error::Result, other_err};
 
 const DHT_N_SUBKEYS: u16 = 3;
@@ -14,12 +16,11 @@ const DHT_SUBKEY_PRIVATE_ROUTE: ValueSubkey = 0;
 const DHT_SUBKEY_SITE_ID: ValueSubkey = 1;
 const DHT_SUBKEY_DB_VERSION: ValueSubkey = 2;
 
-const TABLE_STORE_LOCAL_N_COLUMNS: u32 = 5;
-const TABLE_STORE_LOCAL_COLUMN_SHARED_SECRET: u32 = 0;
-const TABLE_STORE_LOCAL_COLUMN_DHT_KEY: u32 = 1;
-const TABLE_STORE_LOCAL_COLUMN_DHT_OWNER_KEYPAIR: u32 = 2;
+const TABLE_STORE_LOCAL_N_COLUMNS: u32 = 2;
+const TABLE_STORE_LOCAL_COLUMN_DHT_KEY: u32 = 0;
+const TABLE_STORE_LOCAL_COLUMN_DHT_OWNER_KEYPAIR: u32 = 1;
 
-const TABLE_STORE_REMOTES_N_COLUMNS: u32 = 3;
+const TABLE_STORE_REMOTES_N_COLUMNS: u32 = 1;
 const TABLE_STORE_REMOTES_COLUMN_DHT_KEY: u32 = 0;
 
 pub struct Sovereign {
@@ -41,11 +42,6 @@ impl Sovereign {
     pub async fn init(routing_context: &RoutingContext) -> Result<Sovereign> {
         let ts = routing_context.api().table_store()?;
         let db = Self::open_db(&ts).await?;
-        let crypto = routing_context
-            .api()
-            .crypto()?
-            .get(CRYPTO_KIND_VLD0)
-            .ok_or(other_err("missing VLD0 cryptosystem"))?;
 
         // create DHT
         let new_dht = routing_context
@@ -151,11 +147,7 @@ impl Peer {
         Ok(db)
     }
 
-    pub async fn new(
-        api: &VeilidAPI,
-        name: &str,
-        dht_public_key: &str,
-    ) -> Result<Peer> {
+    pub async fn new(api: &VeilidAPI, name: &str, dht_public_key: &str) -> Result<Peer> {
         let ts = api.table_store()?;
         let db = Self::open_db(&ts).await?;
         let db_key = name.as_bytes().to_vec();
@@ -266,12 +258,12 @@ pub struct Conclave {
 
 impl Conclave {
     pub async fn new(routing_context: RoutingContext) -> Result<Conclave> {
-        let mut sovereign = match Sovereign::load(&routing_context).await? {
+        let sovereign = match Sovereign::load(&routing_context).await? {
             Some(sov) => sov,
             None => Sovereign::init(&routing_context).await?,
         };
 
-        let mut remotes = Peer::load_all(&routing_context.api()).await?;
+        let remotes = Peer::load_all(&routing_context.api()).await?;
 
         Ok(Conclave {
             routing_context,
@@ -296,13 +288,61 @@ impl Conclave {
         return self.remotes.get(name);
     }
 
-    pub async fn set_peer(&mut self, mut peer: Peer) -> Result<()> {
+    pub async fn set_peer(&mut self, peer: Peer) -> Result<()> {
         self.remotes.insert(peer.name.clone(), peer);
         Ok(())
     }
 
     pub fn peers<'a>(&'a self) -> std::collections::hash_map::Values<'a, String, Peer> {
         self.remotes.values().into_iter()
+    }
+
+    pub async fn status(&self, peer: &Peer) -> Result<StatusResponse> {
+        let crypto = self.crypto(peer)?;
+        let req_bytes = crypto.encode(Request::Status)?;
+        let resp_bytes = self
+            .routing_context
+            .app_call(
+                Target::PrivateRoute(peer.route_id.ok_or(other_err("no route to peer"))?),
+                req_bytes,
+            )
+            .await?;
+        match crypto.decode::<Response>(&resp_bytes)? {
+            Response::Status(status) => Ok(status),
+            r => Err(other_err(format!("invalid response: {:?}", r))),
+        }
+    }
+
+    pub async fn changes(
+        &self,
+        peer: &Peer,
+        since_db_version: i64,
+    ) -> Result<ChangesResponse> {
+        let crypto = self.crypto(peer)?;
+        let req_bytes = crypto.encode(Request::Changes { since_db_version })?;
+        let resp_bytes = self
+            .routing_context
+            .app_call(
+                Target::PrivateRoute(peer.route_id.ok_or(other_err("no route to peer"))?),
+                req_bytes,
+            )
+            .await?;
+        match crypto.decode::<Response>(&resp_bytes)? {
+            Response::Changes(changes) => Ok(changes),
+            r => Err(other_err(format!("invalid response: {:?}", r))),
+        }
+    }
+
+    fn crypto(&self, peer: &Peer) -> Result<Crypto> {
+        Ok(Crypto::new(
+            self.routing_context
+                .api()
+                .crypto()?
+                .get(CRYPTO_KIND_VLD0)
+                .ok_or(other_err("VLD0 not available"))?,
+            self.sovereign.dht_owner_keypair,
+            peer.dht_public_key,
+        ))
     }
 
     pub async fn close(mut self) -> Result<()> {
@@ -328,7 +368,8 @@ mod tests {
 
         let api = setup_api().await;
         let routing_context = api
-            .routing_context().expect("routing context")
+            .routing_context()
+            .expect("routing context")
             .with_sequencing(Sequencing::PreferOrdered)
             .with_default_safety()
             .expect("ok");
