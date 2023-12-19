@@ -7,7 +7,7 @@ use ddcp::{
     cli::{Cli, Commands, RemoteArgs, RemoteCommands},
     other_err,
     Error,
-    Result, //DDCP,
+    Result, DDCP, //DDCP,
 };
 
 #[tokio::main]
@@ -28,8 +28,6 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    todo!();
-    /*
     let cli = Cli::parse();
 
     let (db_file, state_dir, ext_file) = (cli.db_file()?, cli.state_dir()?, cli.ext_file()?);
@@ -58,8 +56,8 @@ async fn run() -> Result<()> {
 
     let result = match cli.commands {
         Commands::Init => {
-            let addr = app.init().await?;
-            info!(key = addr, "Registered database at DHT");
+            let (addr, _site_id, version) = app.push().await?;
+            info!(key = addr, db_version = version, "Registered database at DHT");
             Ok(())
         }
         Commands::Push => {
@@ -72,17 +70,23 @@ async fn run() -> Result<()> {
         }) => app.remote_add(name, addr).await,
         Commands::Remote(RemoteArgs {
             commands: RemoteCommands::Remove { name },
-        }) => app.remote_remove(name).await,
+        }) => {
+            match app.remote_remove(name.clone()).await? {
+                true => info!(peer = name, "removed peer"),
+                false => info!(peer = name, "peer not found"),
+            };
+            Ok(())
+        }
         Commands::Remote(RemoteArgs {
             commands: RemoteCommands::List,
         }) => {
-            let remotes = app.remotes().await?;
+            let remotes = app.remotes();
             for remote in remotes.iter() {
                 info!("{}\t{}", remote.0, remote.1);
             }
             Ok(())
         }
-        Commands::Serve => app.serve().await,
+        Commands::Serve => return app.serve().await,
         Commands::Cleanup => Ok(()),
         Commands::Pull { name } => match name {
             Some(name) => {
@@ -90,7 +94,7 @@ async fn run() -> Result<()> {
                 Ok(())
             }
             None => {
-                let remotes = app.remotes().await?;
+                let remotes = app.remotes();
                 let mut errors = vec![];
                 for (name, _) in remotes.iter() {
                     if let Err(e) = app.pull(name).await {
@@ -109,5 +113,4 @@ async fn run() -> Result<()> {
 
     app.cleanup().await?;
     result
-    */
 }

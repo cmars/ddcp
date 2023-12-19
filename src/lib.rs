@@ -1,19 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use flume::{unbounded, Receiver, Sender};
-use ident::{Conclave, Peer};
-use rusqlite::{params, types::Value, OptionalExtension};
-use tokio::{
-    select, signal,
-    task::{JoinHandle, JoinSet},
-};
-use tokio_rusqlite::Connection;
+use tokio::{select, signal, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, trace, warn, Level};
-use veilid_core::{
-    CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    RouteId, RoutingContext, Sequencing, SharedSecret, Target, ValueSubkey, VeilidUpdate,
-};
+use tracing::{debug, error, info, instrument, warn, Level};
+use veilid_core::{CryptoKey, CryptoTyped, RoutingContext, Sequencing, VeilidUpdate};
 
 pub mod cli;
 mod db;
@@ -24,7 +15,12 @@ pub mod veilid_config;
 
 use db::DB;
 pub use error::{other_err, Error, Result};
+use ident::{Conclave, Peer, Status};
+use proto::codec::{
+    ChangesResponse, Decodable, Envelope, NodeStatus, Request, Response, StatusResponse,
+};
 
+#[derive(Clone)]
 pub struct DDCP {
     db: DB,
     routing_context: RoutingContext,
@@ -41,7 +37,7 @@ impl DDCP {
         let (routing_context, updates) = DDCP::new_routing_context(state_path).await?;
         Ok(DDCP {
             db,
-            conclave: Conclave::new(routing_context.clone()),
+            conclave: Conclave::new(routing_context.clone()).await?,
             routing_context,
             updates,
         })
@@ -76,7 +72,7 @@ impl DDCP {
     }
 
     #[instrument(skip(self), level = Level::INFO, ret, err)]
-    pub async fn wait_for_network(&self) -> Result<()> {
+    pub async fn wait_for_network(&mut self) -> Result<()> {
         // Wait for network to be up
         loop {
             let res = self.updates.recv_async().await;
@@ -110,32 +106,13 @@ impl DDCP {
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn push(&mut self) -> Result<(String, Vec<u8>, i64)> {
-        let (site_id, db_version) = self.db.status();
-
+        let (site_id, db_version) = self.db.status().await?;
         self.conclave
-            .refresh(Some(Status {
-                site_id,
+            .refresh(Status {
+                site_id: site_id.clone(),
                 db_version,
-            }))
+            })
             .await?;
-
-        // Load or create DHT key
-        let local_dht = self.ensure_dht_keypair(LOCAL_KEYPAIR_NAME).await?;
-        let addr = local_dht.key().to_string();
-        self.dht_keypair = Some(local_dht.clone());
-
-        let key = local_dht.key().to_owned();
-
-        let (site_id, db_version) = status(&self.conn).await?;
-
-        // Push current db state
-        self.node
-            .set_dht_value(key, SUBKEY_SITE_ID, site_id.clone())
-            .await?;
-        self.node
-            .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
-            .await?;
-
         Ok((
             self.conclave.sovereign().dht_key().to_string(),
             site_id,
@@ -146,13 +123,25 @@ impl DDCP {
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn pull(&mut self, name: &str) -> Result<(bool, i64)> {
         // Get latest status from DHT
-        let peer = self.conclave.peer(name).ok_or(other_err("unknown peer"))?;
-        let peer_status = peer
-            .refresh(&self.routing_context)
-            .await?
-            .ok_or(other_err("peer missing status"))?;
+        {
+            let peer = self
+                .conclave
+                .peer_mut(name)
+                .ok_or(other_err("unknown peer"))?;
+            peer.refresh(&self.routing_context)
+                .await?;
+        }
 
-        let tracked_version = self.db.tracked_peer_version(peer_status.site_id).await?;
+        let peer = self.conclave.peer(name).ok_or(other_err("unknown peer"))?;
+        let node_status = peer.node_status().ok_or(other_err("peer missing status"))?;
+        self.pull_from(peer, &node_status).await
+    }
+
+    async fn pull_from(&self, peer: &Peer, peer_status: &NodeStatus) -> Result<(bool, i64)> {
+        let tracked_version = self
+            .db
+            .tracked_peer_version(peer_status.site_id.clone())
+            .await?;
         if peer_status.db_version <= tracked_version {
             return Ok((false, tracked_version));
         }
@@ -163,7 +152,7 @@ impl DDCP {
         );
 
         let resp = self.conclave.changes(peer, tracked_version).await?;
-        if resp.site_id != &peer_status.site_id {
+        if resp.site_id.as_slice() != peer_status.site_id.as_slice() {
             return Err(other_err("mismatched site_id"));
         }
 
@@ -174,7 +163,10 @@ impl DDCP {
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn cleanup(self) -> Result<()> {
         // Release DHT resources
-        self.conclave.close()?;
+        self.conclave.close().await?;
+
+        // Shut down Veilid node
+        self.routing_context.api().shutdown().await;
 
         // Release cr_sqlite resources
         self.db.close().await?;
@@ -183,333 +175,168 @@ impl DDCP {
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub async fn remote_add(&self, name: String, addr: String) -> Result<()> {
+    pub async fn remote_add(&mut self, name: String, addr: String) -> Result<()> {
         let peer = Peer::new(&self.routing_context.api(), name.as_str(), addr.as_str()).await?;
         self.conclave.set_peer(peer).await?;
         Ok(())
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub async fn remote_remove(&self, name: String) -> Result<()> {
-        todo!(); // TODO: need to add Conclave::remove_peer
+    pub async fn remote_remove(&mut self, name: String) -> Result<bool> {
+        self.conclave.remove_peer(name.as_str()).await
+    }
+
+    pub fn remotes(&self) -> Vec<(String, CryptoTyped<CryptoKey>)> {
+        self.conclave
+            .peers()
+            .map(|peer| (peer.name(), peer.dht_key()))
+            .collect()
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
-        todo!(); // TODO: implement peer getters like this:
-                 //self.conclave.peers().map(|peer| {(peer.name(), peer.dht_public_key.to_string())})
+    pub async fn serve(self) -> Result<()> {
+        let token = CancellationToken::new();
+
+        let puller = self.spawn_puller(token.clone());
+        let server = self.spawn_server(token.clone());
+        tokio::spawn(async move {
+            signal::ctrl_c().await?;
+            warn!("interrupt received");
+            token.cancel();
+            Ok::<(), Error>(())
+        });
+
+        tokio::join!(puller, server);
+        Ok(())
     }
 
-    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub async fn serve(&mut self) -> Result<()> {
-        let mut run = true;
-
-        while run {
-            // Create a private route and publish it
-            let (route_id, route_blob) = self.node.new_private_route().await?;
-            let local_dht = self.ensure_dht_keypair(LOCAL_KEYPAIR_NAME).await?;
-            self.dht_keypair = Some(local_dht.clone());
-            self.node
-                .set_dht_value(local_dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, route_blob)
-                .await?;
-
-            let cancel = CancellationToken::new();
-            let local_tracker = self
-                .local_tracker(cancel.clone(), local_dht.clone())
-                .await?;
-            let mut remote_tracker = self.remote_tracker(cancel.clone()).await?;
-
-            info!(key = local_dht.key().to_string(), "Serving database at DHT");
-
-            // Handle requests from peers
+    async fn spawn_puller(&self, token: CancellationToken) -> JoinHandle<Result<()>> {
+        let mut puller = self.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(REMOTE_TRACKER_PERIOD);
             loop {
                 select! {
-                    res = self.node.recv_updates_async() => {
+                    _ = timer.tick() => {
+                        info!("refreshing peers");
+                        if let Err(e) = puller.conclave.refresh_peers().await {
+                            error!(err = format!("{:?}", e), "refresh failed");
+                            continue
+                        }
+
+                        for peer in puller.conclave.peers() {
+                            info!(name = peer.name(), "pulling from peer");
+                            let peer_status = match peer.node_status() {
+                                    Some(status) => status,
+                                    None => {
+                                        error!("peer missing status");
+                                        continue
+                                    }
+                                };
+                            if let Err(e) = puller.pull_from(peer, &peer_status).await {
+                                error!(err = format!("{:?}", e), name = peer.name(), "pull failed");
+                            } else {
+                                info!(name = peer.name(), "pull ok");
+                            }
+                        }
+                    }
+                    _ = token.cancelled() => {
+                        return Ok(());
+                    }
+                }
+            }
+        })
+    }
+
+    async fn spawn_server(&self, token: CancellationToken) -> JoinHandle<Result<()>> {
+        let mut server = self.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(LOCAL_TRACKER_PERIOD);
+            let peer_by_key = HashMap::from_iter(
+                server
+                    .conclave
+                    .peers()
+                    .map(|peer| (peer.dht_key().to_string(), peer.clone())),
+            );
+            loop {
+                select! {
+                    _ = timer.tick() => {
+                        // TODO: spawn this? how long does it block the loop?
+                        if let Err(e) = server.push().await {
+                            error!(err = format!("{:?}", e), "failed to push status");
+                        }
+                    }
+                    res = server.updates.recv_async() => {
                         match res {
                             Ok(update) => {
-                                let restart = self.handle_update(update, &route_id).await?;
-                                if restart {
-                                    info!("Restarting");
-                                    break
+                                if let Err(e) = server.handle_update(&peer_by_key, update).await {
+                                    error!(err = format!("{:?}", e), "failed to handle update");
                                 }
                             }
                             Err(e) => return Err(other_err(e)),
                         }
                     }
-                    _ = signal::ctrl_c() => {
-                        warn!("Interrupt received");
-                        cancel.cancel();
-                        run = false;
-                        break
+                    _ = token.cancelled() => {
+                        return server.cleanup().await;
                     }
                 }
             }
-            if let Err(e) = self.node.release_private_route(route_id) {
-                warn!(
-                    route_id = route_id.to_string(),
-                    err = format!("{:?}", e),
-                    "Failed to release private route"
-                );
-            }
-            while let Some(res) = remote_tracker.join_next().await {
-                if let Err(e) = res {
-                    warn!(
-                        err = format!("{:?}", e),
-                        "Error shutting down remote tracker"
-                    );
-                }
-            }
-            if let Err(e) = local_tracker.await.map_err(other_err)? {
-                warn!(err = format!("{:?}", e), "Error shutting own local tracker");
-            }
-        }
-        Ok(())
+        })
     }
 
-    pub(crate) async fn handle_update(
+    async fn handle_update(
         &mut self,
+        peer_by_sender: &HashMap<String, Peer>,
         update: VeilidUpdate,
-        current_route: &RouteId,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         match update {
             VeilidUpdate::AppCall(app_call) => {
-                let request = match proto::decode_message::<proto::request::Reader, proto::Request>(
-                    app_call.message(),
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(err = format!("{:?}", e), "Invalid app_call request");
-                        return Ok(false);
+                let envelope = Envelope::decode(app_call.message())?;
+                let peer = match peer_by_sender.get(&envelope.sender) {
+                    Some(peer) => peer.clone(),
+                    None => {
+                        warn!(sender = envelope.sender, "unknown peer");
+                        return Ok(());
                     }
                 };
-                match request {
-                    Request::Status => {
-                        let (site_id, db_version) = status(&self.conn).await?;
-                        let resp = proto::encode_message(&Response::Status {
-                            site_id,
-                            db_version,
-                        })?;
-                        let node = self.node.clone_box();
-                        tokio::spawn(async move { node.app_call_reply(app_call.id(), resp).await });
-                    }
-                    Request::Changes { since_db_version } => {
-                        let (site_id, changes) = changes(&self.conn, since_db_version).await?;
-                        let resp = proto::encode_message(&Response::Changes { site_id, changes })?;
-                        let node = self.node.clone_box();
-                        tokio::spawn(async move { node.app_call_reply(app_call.id(), resp).await });
-                    }
-                }
-            }
-            VeilidUpdate::Shutdown => {
-                return Err(Error::VeilidAPI(veilid_core::VeilidAPIError::Shutdown))
-            }
-            VeilidUpdate::RouteChange(route_change) => {
-                for dead_route in route_change.dead_routes {
-                    if dead_route == *current_route {
-                        warn!(route = current_route.to_string(), "Current route is dead");
-                        return Ok(true);
-                    }
-                }
-            }
-            _ => return Ok(false),
-        }
-        Ok(false)
-    }
 
-    /// Poll local db for changes in latest db version, update DHT.
-    #[instrument(skip(self), level = Level::DEBUG, err)]
-    async fn local_tracker(
-        &self,
-        cancel_token: CancellationToken,
-        local_dht: DHTRecordDescriptor,
-    ) -> Result<JoinHandle<Result<()>>> {
-        let conn = self.conn.clone();
-        let mut node = self.node.clone_box();
-        let key = local_dht.key().to_owned();
-        let mut timer = tokio::time::interval(LOCAL_TRACKER_PERIOD);
-
-        let h = tokio::spawn(async move {
-            let mut prev_db_version = -1;
-            loop {
-                select! {
-                    // TODO: watch db for changes (filesystem changes, sqlite magic, control socket)
-                    _ = timer.tick() => {
-                        let (site_id, db_version) = status(&conn).await?;
-                        if db_version <= prev_db_version {
-                            continue;
+                // spawn a responder, don't block the event loop
+                let responder = self.clone();
+                tokio::spawn(async move {
+                    let crypto = responder.conclave.crypto(&peer)?;
+                    let request = crypto.decode::<Request>(app_call.message())?;
+                    let resp = match request {
+                        Request::Status => {
+                            let (site_id, db_version) = responder.db.status().await?;
+                            crypto.encode(Response::Status(StatusResponse {
+                                site_id,
+                                db_version,
+                            }))?
                         }
-
-                        node.set_dht_value(key, SUBKEY_SITE_ID, site_id).await?;
-                        node
-                            .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
-                            .await?;
-                        info!(db_version, key = key.to_string(), "Database changed, updated status");
-                        prev_db_version = db_version;
-                    }
-                    _ = cancel_token.cancelled() => {
-                        break;
-                    }
-                }
-            }
-            Ok(())
-        });
-        Ok(h)
-    }
-
-    /// Poll remotes for changes.
-    #[instrument(skip(self, cancel_token), level = Level::DEBUG, err)]
-    async fn remote_tracker(&self, cancel_token: CancellationToken) -> Result<JoinSet<Result<()>>> {
-        let mut joins = JoinSet::new();
-        let remotes = self.remotes().await?;
-        for remote in remotes {
-            let mut ddcp = Self::new_conn_node(self.conn.clone(), self.node.clone_box());
-            let mut timer = tokio::time::interval(REMOTE_TRACKER_PERIOD);
-            let remote_cancel = cancel_token.clone();
-
-            let remote_name = remote.0.clone();
-            joins.spawn(async move {
-            loop {
-                select! {
-                    // TODO: use Veilid DHT watch when it's implemented
-                    _ = timer.tick() => {
-                        match ddcp.pull(&remote_name).await {
-                            Ok((updated, db_version)) => {
-                                if updated {
-                                    info!(remote_name, db_version, "Pulled changes from remote database");
-                                } else {
-                                    debug!(remote_name, updated, db_version, "no changes");
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to pull from {}: {:?}", remote_name, e);
-                            }
+                        Request::Changes { since_db_version } => {
+                            let (site_id, changes) = responder.db.changes(since_db_version).await?;
+                            crypto
+                                .encode(Response::Changes(ChangesResponse { site_id, changes }))?
                         }
-                    }
-                    _ = remote_cancel.cancelled() => {
-                        break;
-                    }
-                }
+                    };
+                    responder
+                        .routing_context
+                        .api()
+                        .app_call_reply(app_call.id(), resp)
+                        .await?;
+                    Ok::<(), Error>(())
+                }); // TODO: instrument
+                Ok(())
             }
-            Ok(())
-        });
-        }
-        Ok(joins)
-    }
-}
-
-#[cfg(feature = "todo")]
-#[instrument(skip(node), level = Level::DEBUG, err)]
-pub(crate) async fn remote_status(
-    node: Box<dyn Node>,
-    name: &str,
-) -> Result<(Vec<u8>, i64, Vec<u8>)> {
-    let (prior_dht_key, prior_site_id) = node.store().load_remote(name).await?;
-    let dht = match prior_dht_key {
-        Some(key) => node.open_dht_record(key, None).await?,
-        None => return Err(other_err(format!("remote {} not found", name))),
-    };
-    let maybe_site_id = node
-        .get_dht_value(dht.key().to_owned(), SUBKEY_SITE_ID, true)
-        .await?;
-    let maybe_db_version = node
-        .get_dht_value(dht.key().to_owned(), SUBKEY_DB_VERSION, true)
-        .await?;
-    let maybe_route_blob = node
-        .get_dht_value(dht.key().to_owned(), SUBKEY_PRIVATE_ROUTE, true)
-        .await?;
-    if let Err(e) = node.close_dht_record(dht.key().to_owned()).await {
-        warn!(
-            err = format!("{:?}", e),
-            key = dht.key().to_string(),
-            "failed to close dht record"
-        )
-    }
-
-    if let (None, Some(site_id)) = (prior_site_id, &maybe_site_id) {
-        node.store()
-            .store_remote_site_id(name, site_id.data().to_owned())
-            .await?;
-    }
-
-    Ok(match (maybe_site_id, maybe_db_version, maybe_route_blob) {
-        (Some(sid), Some(dbv), Some(rt)) => {
-            let dbv_arr: [u8; 8] = dbv.data().try_into().map_err(other_err)?;
-            (
-                sid.data().to_owned(),
-                i64::from_be_bytes(dbv_arr),
-                rt.data().to_owned(),
-            )
-        }
-        _ => return Err(other_err(format!("remote {} not available", name))),
-    })
-}
-
-#[cfg(feature = "todo")]
-#[instrument(skip(conn), level = Level::DEBUG, ret, err)]
-pub async fn status(conn: &Connection) -> Result<NodeStatus> {
-    let (site_id, db_version) = conn
-        .call(|c| {
-            c.query_row(
-                "
-select crsql_site_id(), coalesce((select max(db_version) from crsql_changes where site_id is null), 0);",
-                [],
-                |row| Ok((row.get::<usize, Vec<u8>>(0)?, row.get::<usize, i64>(1)?)),
-            )
-        })
-        .await?;
-    Ok(NodeStatus {
-        site_id,
-        db_version,
-        route: vec![],
-    })
-}
-
-#[cfg(feature = "todo")]
-#[instrument(skip(conn), level = Level::DEBUG)]
-pub async fn changes(
-    conn: &Connection,
-    since_db_version: i64,
-) -> Result<(Vec<u8>, Vec<proto::Change>)> {
-    let (site_id, db_version) = status(conn).await?;
-    if since_db_version >= db_version {
-        return Ok((site_id, vec![]));
-    }
-    let changes = conn
-        .call(move |c| {
-            let mut stmt = c.prepare(
-                "
-select
-    \"table\",
-    pk,
-    cid,
-    val,
-    col_version,
-    db_version,
-    cl,
-    seq
-from crsql_changes
-where db_version > ?
-and site_id is null",
-            )?;
-            let mut result = vec![];
-            let mut rows = stmt.query([since_db_version])?;
-            while let Some(row) = rows.next()? {
-                let change = proto::Change {
-                    table: row.get::<usize, String>(0)?,
-                    pk: row.get::<usize, Vec<u8>>(1)?,
-                    cid: row.get::<usize, String>(2)?,
-                    val: row.get::<usize, Value>(3)?,
-                    col_version: row.get::<usize, i64>(4)?,
-                    db_version: row.get::<usize, i64>(5)?,
-                    cl: row.get::<usize, i64>(6)?,
-                    seq: row.get::<usize, i64>(7)?,
-                };
-                result.push(change);
+            VeilidUpdate::Shutdown => Err(Error::VeilidAPI(veilid_core::VeilidAPIError::Shutdown)),
+            VeilidUpdate::RouteChange(_) => {
+                self.conclave
+                    .sovereign_mut()
+                    .release_route(&self.routing_context)?;
+                Ok(())
             }
-            Ok(result)
-        })
-        .await?;
-    Ok((site_id, changes))
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]

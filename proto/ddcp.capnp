@@ -1,5 +1,10 @@
 @0xc9cb850366986f30;
 
+struct Envelope {
+    sender @0 :Text;
+    contents @1 :Data;
+}
+
 struct Request {
     union {
         status @0 :Void;

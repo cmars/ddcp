@@ -8,7 +8,7 @@ use rusqlite::types::Value;
 
 use super::{
     ddcp_capnp::request,
-    ddcp_capnp::{change_value, node_status, response},
+    ddcp_capnp::{change_value, node_status, response, envelope},
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -219,6 +219,34 @@ impl Decodable for NodeStatus {
             site_id: db_status.get_site_id()?.to_vec(),
             db_version: db_status.get_db_version(),
             route: node_status_reader.get_route()?.to_vec(),
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Envelope {
+    pub sender: String,
+    pub contents: Vec<u8>,
+}
+
+impl Encodable for Envelope {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut builder = message::Builder::new_default();
+        let mut envelope_builder = builder.get_root::<envelope::Builder>()?;
+        envelope_builder.set_sender(self.sender.as_str().into());
+        envelope_builder.set_contents(self.contents.as_slice());
+        let message = serialize::write_message_segments_to_words(&builder);
+        Ok(message)
+    }
+}
+
+impl Decodable for Envelope {
+    fn decode(message: &[u8]) -> Result<Self> {
+        let reader = serialize::read_message(message, ReaderOptions::new())?;
+        let envelope_reader = reader.get_root::<envelope::Reader>()?;
+        Ok(Envelope {
+            sender: envelope_reader.get_sender()?.to_string().map_err(|e| Utf8Error::from(e))?,
+            contents: envelope_reader.get_contents()?.to_vec(),
         })
     }
 }

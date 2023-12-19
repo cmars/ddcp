@@ -3,13 +3,13 @@ use rusqlite::{params, OptionalExtension};
 use tokio_rusqlite::Connection;
 use tracing::{debug, instrument, trace, Level};
 
-use crate::proto;
 use crate::proto::codec::Change;
-use crate::{error::Result, other_err};
+use crate::error::Result;
 
 pub const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
 pub const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
 
+#[derive(Clone)]
 pub struct DB {
     conn: Connection,
 }
@@ -244,6 +244,8 @@ mod tests {
         let (site_id_1, version_1) = db_1.status().await.expect("status");
         let (site_id_2, version_2) = db_2.status().await.expect("status");
 
+        assert_ne!(site_id_1, site_id_2);
+
         // Make changes in the first database
         db_1.conn
             .call(move |conn| {
@@ -293,6 +295,7 @@ mod tests {
 
         // merged_version is db_1's merged version, as tracked by db_2
         assert_eq!(db_1.status().await.expect("db_1 status").1, merged_version);
+        assert!(merged_version > version_2);
 
         let result = db_2
             .conn
