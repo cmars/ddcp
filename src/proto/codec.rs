@@ -36,14 +36,14 @@ pub enum Response {
 
 #[derive(Debug, PartialEq)]
 pub struct StatusResponse {
-        site_id: Vec<u8>,
-        db_version: i64,
+    pub site_id: Vec<u8>,
+    pub db_version: i64,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ChangesResponse {
-        site_id: Vec<u8>,
-        changes: Vec<Change>,
+    pub site_id: Vec<u8>,
+    pub changes: Vec<Change>,
 }
 
 pub trait Encodable {
@@ -131,7 +131,7 @@ impl Encodable for Response {
                     };
                 }
             }
-            Response::Status (StatusResponse {
+            Response::Status(StatusResponse {
                 site_id,
                 db_version,
             }) => {
@@ -151,7 +151,7 @@ impl Decodable for Response {
         let response_reader = reader.get_root::<response::Reader>()?;
         let which = response_reader.which()?;
         Ok(match which {
-            response::Which::Status(Ok(status)) => Response::Status (StatusResponse{
+            response::Which::Status(Ok(status)) => Response::Status(StatusResponse {
                 db_version: status.get_db_version(),
                 site_id: status.get_site_id()?.to_vec(),
             }),
@@ -239,11 +239,12 @@ mod tests {
         let msg_bytes = Response::Status(StatusResponse {
             site_id: "foo".as_bytes().to_vec(),
             db_version: 42,
-        }).encode()
+        })
+        .encode()
         .expect("ok");
         let decoded = Response::decode(&msg_bytes).expect("ok");
         assert_eq!(
-            Response::Status (StatusResponse{
+            Response::Status(StatusResponse {
                 site_id: "foo".as_bytes().to_vec(),
                 db_version: 42
             }),
@@ -255,7 +256,8 @@ mod tests {
     fn request_changes() {
         let msg_bytes = Request::Changes {
             since_db_version: 42,
-        }.encode()
+        }
+        .encode()
         .expect("ok");
         let decoded = Request::decode(&msg_bytes).expect("ok");
         assert_eq!(
@@ -271,11 +273,12 @@ mod tests {
         let msg_bytes = Response::Changes(ChangesResponse {
             site_id: "foo".as_bytes().to_vec(),
             changes: vec![],
-        }).encode()
+        })
+        .encode()
         .expect("ok");
         let decoded = Response::decode(&msg_bytes).expect("ok");
         assert_eq!(
-            Response::Changes (ChangesResponse{
+            Response::Changes(ChangesResponse {
                 site_id: "foo".as_bytes().to_vec(),
                 changes: vec![]
             }),
@@ -307,7 +310,7 @@ mod tests {
                 seq: 1111,
             },
         ];
-        let msg_bytes = Response::Changes (ChangesResponse{
+        let msg_bytes = Response::Changes(ChangesResponse {
             site_id: "foo".as_bytes().to_vec(),
             changes: changes.clone(),
         })
@@ -315,7 +318,7 @@ mod tests {
         .expect("ok");
         let decoded = Response::decode(&msg_bytes).expect("ok");
         assert_eq!(
-            Response::Changes (ChangesResponse{
+            Response::Changes(ChangesResponse {
                 site_id: "foo".as_bytes().to_vec(),
                 changes,
             }),

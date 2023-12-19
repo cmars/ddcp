@@ -1,8 +1,7 @@
 use std::array::TryFromSliceError;
 
 use veilid_core::{
-    CryptoSystemVersion, Nonce, TypedKey,
-    TypedKeyPair, VeilidAPIError, NONCE_LENGTH,
+    CryptoSystemVersion, Nonce, TypedKey, TypedKeyPair, VeilidAPIError, NONCE_LENGTH,
 };
 
 use crate::proto::codec;

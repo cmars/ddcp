@@ -311,7 +311,10 @@ mod tests {
             })
             .await
             .expect("contents of db_2");
-        assert_eq!(result, vec![(1, 1, "🌟".to_string()), (2, 2, "🚀".to_string()),]);
+        assert_eq!(
+            result,
+            vec![(1, 1, "🌟".to_string()), (2, 2, "🚀".to_string()),]
+        );
 
         // Close databases
         db_1.close().await.expect("close db_1");

@@ -1,20 +1,19 @@
 use std::collections::HashMap;
 
 use veilid_core::{
-    CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, RouteId,
-    RoutingContext, TableDB, TableStore, TypedKey, TypedKeyPair, ValueSubkey,
-    VeilidAPI, CRYPTO_KIND_VLD0,
+    CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, RouteId, RoutingContext, TableDB,
+    TableStore, TypedKey, TypedKeyPair, ValueSubkey, VeilidAPI, CRYPTO_KIND_VLD0,
 };
 use veilid_core::{FromStr, Target};
 
-use crate::proto::codec::{ChangesResponse, Response, StatusResponse, Request};
+use crate::proto::codec::{
+    ChangesResponse, Decodable, Encodable, NodeStatus, Request, Response, StatusResponse,
+};
 use crate::proto::crypto::Crypto;
 use crate::{error::Result, other_err};
 
 const DHT_N_SUBKEYS: u16 = 3;
-const DHT_SUBKEY_PRIVATE_ROUTE: ValueSubkey = 0;
-const DHT_SUBKEY_SITE_ID: ValueSubkey = 1;
-const DHT_SUBKEY_DB_VERSION: ValueSubkey = 2;
+const DHT_SUBKEY_STATUS: ValueSubkey = 0;
 
 const TABLE_STORE_LOCAL_N_COLUMNS: u32 = 2;
 const TABLE_STORE_LOCAL_COLUMN_DHT_KEY: u32 = 0;
@@ -28,7 +27,17 @@ pub struct Sovereign {
     dht_owner_keypair: CryptoTyped<KeyPair>,
 
     dht: Option<DHTRecordDescriptor>,
-    route_id: Option<RouteId>,
+    route: Option<Route>,
+}
+
+struct Route {
+    id: RouteId,
+    data: Vec<u8>,
+}
+
+pub struct Status {
+    pub site_id: Vec<u8>,
+    pub db_version: i64,
 }
 
 impl Sovereign {
@@ -37,6 +46,10 @@ impl Sovereign {
             .open("ddcp_conclave_local", TABLE_STORE_LOCAL_N_COLUMNS)
             .await?;
         Ok(db)
+    }
+
+    pub fn dht_key(&self) -> TypedKey {
+        self.dht_key
     }
 
     pub async fn init(routing_context: &RoutingContext) -> Result<Sovereign> {
@@ -102,18 +115,47 @@ impl Sovereign {
             dht_key,
             dht_owner_keypair,
             dht: Some(dht),
-            route_id: None,
+            route: None,
         }))
     }
 
-    pub async fn announce(&mut self, routing_context: &RoutingContext) -> Result<()> {
-        if let Some(route_id) = self.route_id {
-            routing_context.api().release_private_route(route_id)?;
+    pub fn release_route(&mut self) -> Result<()> {
+        if let Some(route) = self.route {
+            routing_context.api().release_private_route(route.id)?;
+            self.route = None
         }
-        let (route_id, route_blob) = routing_context.api().new_private_route().await?;
-        self.route_id = Some(route_id);
+        Ok(())
+    }
+
+    pub async fn announce(
+        &mut self,
+        routing_context: &RoutingContext,
+        status: Option<Status>,
+    ) -> Result<()> {
+        if let None = status {
+            // Nothing to announce
+            return Ok(());
+        }
+
+        let route = if let None = self.route {
+            let (id, data) = routing_context.api().new_private_route().await?;
+            self.route = Some(Route { id, data });
+            &self.route
+        } else {
+            &self.route
+        };
+
         routing_context
-            .set_dht_value(self.dht_key, DHT_SUBKEY_PRIVATE_ROUTE, route_blob)
+            .set_dht_value(
+                self.dht_key,
+                DHT_SUBKEY_STATUS,
+                NodeStatus {
+                    site_id: status.site_id.clone(),
+                    db_version: status.db_version,
+                    route: route.data,
+                }
+                .encode()?,
+            )
             .await?;
         Ok(())
     }
@@ -136,6 +178,7 @@ pub struct Peer {
     dht_public_key: TypedKey,
 
     dht: Option<DHTRecordDescriptor>,
+    status: Option<NodeStatus>,
     route_id: Option<RouteId>,
 }
 
@@ -189,14 +232,15 @@ impl Peer {
             name: name.to_owned(),
             dht_public_key,
             dht: None,
+            status: None,
             route_id: None,
         })
     }
 
-    pub async fn refresh(&mut self, routing_context: &RoutingContext) -> Result<()> {
+    pub async fn refresh(&mut self, routing_context: &RoutingContext) -> Result<Option<Status>> {
         self.refresh_dht(routing_context).await?;
         self.refresh_route(routing_context).await?;
-        Ok(())
+        Ok(self.status())
     }
 
     async fn refresh_dht(&mut self, routing_context: &RoutingContext) -> Result<()> {
@@ -210,6 +254,13 @@ impl Peer {
                 .open_dht_record(self.dht_public_key, None)
                 .await?,
         );
+        self.status = match routing_context
+            .get_dht_value(self.dht_public_key, DHT_SUBKEY_STATUS, true)
+            .await?
+        {
+            Some(data) => Some(NodeStatus::decode(data.data())?),
+            None => None,
+        };
         Ok(())
     }
 
@@ -218,20 +269,18 @@ impl Peer {
             routing_context.api().release_private_route(route_id)?;
         }
 
-        match routing_context
-            .get_dht_value(self.dht_public_key, DHT_SUBKEY_PRIVATE_ROUTE, true)
-            .await?
-        {
-            Some(route_data) => {
-                self.route_id = Some(
-                    routing_context
-                        .api()
-                        .import_remote_private_route(route_data.data().to_vec())?,
-                );
-            }
-            None => return Err(other_err("remote DHT missing route")),
+        if let Some(status) = &self.status {
+            self.route_id = Some(
+                routing_context
+                    .api()
+                    .import_remote_private_route(status.route.to_vec())?,
+            );
         }
         Ok(())
+    }
+
+    pub fn status(&self) -> Option<NodeStatus> {
+        self.status.clone()
     }
 
     async fn close(&mut self, routing_context: &RoutingContext) -> Result<()> {
@@ -272,8 +321,10 @@ impl Conclave {
         })
     }
 
-    pub async fn refresh(&mut self) -> Result<()> {
-        self.sovereign.announce(&self.routing_context).await?;
+    pub async fn refresh(&mut self, status: Option<Status>) -> Result<()> {
+        self.sovereign
+            .announce(&self.routing_context, status)
+            .await?;
         for peer in self.remotes.values_mut().into_iter() {
             peer.refresh(&self.routing_context).await?;
         }
@@ -313,11 +364,7 @@ impl Conclave {
         }
     }
 
-    pub async fn changes(
-        &self,
-        peer: &Peer,
-        since_db_version: i64,
-    ) -> Result<ChangesResponse> {
+    pub async fn changes(&self, peer: &Peer, since_db_version: i64) -> Result<ChangesResponse> {
         let crypto = self.crypto(peer)?;
         let req_bytes = crypto.encode(Request::Changes { since_db_version })?;
         let resp_bytes = self

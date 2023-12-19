@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn, Level};
 use veilid_core::{
     CryptoKey, CryptoTyped, DHTRecordDescriptor, DHTSchema, DHTSchemaDFLT, FromStr, KeyPair,
-    RouteId, Sequencing, SharedSecret, Target, ValueSubkey, VeilidUpdate, RoutingContext,
+    RouteId, RoutingContext, Sequencing, SharedSecret, Target, ValueSubkey, VeilidUpdate,
 };
 
 pub mod cli;
@@ -22,11 +22,11 @@ mod ident;
 mod proto;
 pub mod veilid_config;
 
+use db::DB;
 pub use error::{other_err, Error, Result};
 
-#[cfg(feature="todo")]
 pub struct DDCP {
-    conn: Connection,
+    db: DB,
     routing_context: RoutingContext,
     conclave: Conclave,
     updates: Receiver<VeilidUpdate>,
@@ -35,42 +35,21 @@ pub struct DDCP {
 static LOCAL_TRACKER_PERIOD: Duration = Duration::from_secs(60);
 static REMOTE_TRACKER_PERIOD: Duration = Duration::from_secs(60);
 
-#[cfg(feature="todo")]
 impl DDCP {
     pub async fn new(db_path: Option<&str>, state_path: &str, ext_path: &str) -> Result<DDCP> {
-        let conn = DDCP::new_connection(db_path, ext_path).await?;
+        let db = DB::new(db_path, ext_path).await?;
         let (routing_context, updates) = DDCP::new_routing_context(state_path).await?;
         Ok(DDCP {
-            conn,
+            db,
             conclave: Conclave::new(routing_context.clone()),
             routing_context,
             updates,
         })
     }
 
-    async fn new_connection(
-        db_path: Option<&str>,
-        ext_path: &str,
-    ) -> Result<Connection> {
-        let conn = match db_path {
-            Some(path) => Connection::open(path).await,
-            None => Connection::open_in_memory().await,
-        }?;
-        let load_ext_path = ext_path.to_owned();
-        conn.call(move |c| {
-            unsafe {
-                c.load_extension_enable()?;
-                let r = c.load_extension(load_ext_path, Some("sqlite3_crsqlite_init"))?;
-                c.load_extension_disable()?;
-                r
-            };
-            Ok(())
-        })
-        .await?;
-        Ok(conn)
-    }
-
-    async fn new_routing_context(state_path: &str) -> Result<(RoutingContext, Receiver<VeilidUpdate>)> {
+    async fn new_routing_context(
+        state_path: &str,
+    ) -> Result<(RoutingContext, Receiver<VeilidUpdate>)> {
         // Veilid API state channel
         let (node_sender, updates): (
             Sender<veilid_core::VeilidUpdate>,
@@ -123,13 +102,23 @@ impl DDCP {
                 }
             };
         }
-        // Refresh DHT state
-        self.conclave.refresh().await?;
+
+        // Set DHT state
+        self.push().await?;
         Ok(())
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn push(&mut self) -> Result<(String, Vec<u8>, i64)> {
+        let (site_id, db_version) = self.db.status();
+
+        self.conclave
+            .refresh(Some(Status {
+                site_id,
+                db_version,
+            }))
+            .await?;
+
         // Load or create DHT key
         let local_dht = self.ensure_dht_keypair(LOCAL_KEYPAIR_NAME).await?;
         let addr = local_dht.key().to_string();
@@ -147,125 +136,39 @@ impl DDCP {
             .set_dht_value(key, SUBKEY_DB_VERSION, db_version.to_be_bytes().to_vec())
             .await?;
 
-        Ok((addr, site_id, db_version))
+        Ok((
+            self.conclave.sovereign().dht_key().to_string(),
+            site_id,
+            db_version,
+        ))
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn pull(&mut self, name: &str) -> Result<(bool, i64)> {
         // Get latest status from DHT
-        let (site_id, db_version, route_blob) = remote_status(self.node.clone_box(), name).await?;
-
-        // Do we need to fetch newer versions?
-        let tracked_version = match self
-            .conn
-            .call(move |conn| {
-                conn.query_row(
-                    "
-select max(coalesce(version, 0)) from crsql_tracked_peers
-where site_id = ? and event = ?",
-                    params![site_id, CRSQL_TRACKED_EVENT_RECEIVE],
-                    |row| row.get::<usize, Option<i64>>(0),
-                )
-                .optional()
-            })
+        let peer = self.conclave.peer(name).ok_or(other_err("unknown peer"))?;
+        let peer_status = peer
+            .refresh(&self.routing_context)
             .await?
-        {
-            Some(Some(tracked_version)) => {
-                if db_version <= tracked_version {
-                    debug!("remote database {} is up to date", name);
-                    return Ok((false, db_version));
-                }
-                tracked_version
-            }
-            _ => 0,
-        };
+            .ok_or(other_err("peer missing status"))?;
 
-        debug!(db_version, tracked_version, "pulling changes");
-
-        let route_id = self.node.import_remote_private_route(route_blob)?;
-        let msg_bytes = self
-            .node
-            .app_call(
-                Target::PrivateRoute(route_id),
-                proto::encode_message(&Request::Changes {
-                    since_db_version: tracked_version,
-                })?,
-            )
-            .await?;
-        let resp = proto::decode_message::<proto::response::Reader, proto::Response>(msg_bytes.as_slice())?;
-
-        if let Response::Changes { site_id, changes } = resp {
-            self.merge(site_id.clone(), changes).await?;
-        } else {
-            return Err(Error::Other(
-                "Invalid response to changes request".to_string(),
-            ));
+        let tracked_version = self.db.tracked_peer_version(peer_status.site_id).await?;
+        if peer_status.db_version <= tracked_version {
+            return Ok((false, tracked_version));
         }
 
-        if let Err(e) = self.node.release_private_route(route_id) {
-            warn!(
-                route_id = route_id.to_string(),
-                err = format!("{:?}", e),
-                "Failed to release private route"
-            );
+        debug!(
+            db_version = peer_status.db_version,
+            tracked_version, "pulling changes"
+        );
+
+        let resp = self.conclave.changes(peer, tracked_version).await?;
+        if resp.site_id != &peer_status.site_id {
+            return Err(other_err("mismatched site_id"));
         }
 
-        Ok((true, db_version))
-    }
-
-    #[instrument(skip(self, changes), level = Level::DEBUG, ret, err)]
-    pub(crate) async fn merge(
-        &mut self,
-        site_id: Vec<u8>,
-        changes: Vec<proto::Change>,
-    ) -> Result<i64> {
-        let result = self
-            .conn
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                let mut ins_changes = tx.prepare(
-                    "
-insert into crsql_changes (
-    \"table\", pk, cid, val, col_version, db_version, site_id, cl, seq)
-values (?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                )?;
-                let mut max_db_version = 0;
-                for change in changes {
-                    if change.db_version > max_db_version {
-                        max_db_version = change.db_version;
-                    }
-                    ins_changes.execute(params![
-                        change.table,
-                        change.pk,
-                        change.cid,
-                        change.val,
-                        change.col_version,
-                        change.db_version,
-                        &site_id,
-                        change.cl,
-                        change.seq,
-                    ])?;
-                    trace!("merge change {:?} {:?}", change, site_id);
-                }
-                trace!(site_id = format!("{:?}", site_id), max_db_version);
-                tx.execute(
-                    "
-insert into crsql_tracked_peers (site_id, version, tag, event)
-values (?, ?, ?, ?)
-on conflict do update set version = max(version, excluded.version)",
-                    params![
-                        site_id,
-                        max_db_version,
-                        CRSQL_TRACKED_TAG_WHOLE_DATABASE,
-                        CRSQL_TRACKED_EVENT_RECEIVE
-                    ],
-                )?;
-                drop(ins_changes);
-                tx.commit()?;
-                Ok(max_db_version)
-            })
-            .await?;
-        Ok(result)
+        let merge_version = self.db.merge(resp.site_id, resp.changes).await?;
+        Ok((true, merge_version))
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
@@ -273,14 +176,8 @@ on conflict do update set version = max(version, excluded.version)",
         // Release DHT resources
         self.conclave.close()?;
 
-        // Finalize cr-sqlite db
-        self.conn
-            .call(|c| {
-                c.query_row("SELECT crsql_finalize()", [], |_row| Ok(()))?;
-                Ok(())
-            })
-            .await?;
-        debug!("crsql_finalized");
+        // Release cr_sqlite resources
+        self.db.close().await?;
 
         Ok(())
     }
@@ -300,7 +197,7 @@ on conflict do update set version = max(version, excluded.version)",
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
     pub async fn remotes(&self) -> Result<Vec<(String, CryptoTyped<CryptoKey>)>> {
         todo!(); // TODO: implement peer getters like this:
-        //self.conclave.peers().map(|peer| {(peer.name(), peer.dht_public_key.to_string())})
+                 //self.conclave.peers().map(|peer| {(peer.name(), peer.dht_public_key.to_string())})
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
@@ -376,14 +273,15 @@ on conflict do update set version = max(version, excluded.version)",
     ) -> Result<bool> {
         match update {
             VeilidUpdate::AppCall(app_call) => {
-                let request =
-                    match proto::decode_message::<proto::request::Reader, proto::Request>(app_call.message()) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(err = format!("{:?}", e), "Invalid app_call request");
-                            return Ok(false);
-                        }
-                    };
+                let request = match proto::decode_message::<proto::request::Reader, proto::Request>(
+                    app_call.message(),
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(err = format!("{:?}", e), "Invalid app_call request");
+                        return Ok(false);
+                    }
+                };
                 match request {
                     Request::Status => {
                         let (site_id, db_version) = status(&self.conn).await?;
@@ -499,7 +397,7 @@ on conflict do update set version = max(version, excluded.version)",
     }
 }
 
-#[cfg(feature="todo")]
+#[cfg(feature = "todo")]
 #[instrument(skip(node), level = Level::DEBUG, err)]
 pub(crate) async fn remote_status(
     node: Box<dyn Node>,
@@ -546,7 +444,7 @@ pub(crate) async fn remote_status(
     })
 }
 
-#[cfg(feature="todo")]
+#[cfg(feature = "todo")]
 #[instrument(skip(conn), level = Level::DEBUG, ret, err)]
 pub async fn status(conn: &Connection) -> Result<NodeStatus> {
     let (site_id, db_version) = conn
@@ -566,7 +464,7 @@ select crsql_site_id(), coalesce((select max(db_version) from crsql_changes wher
     })
 }
 
-#[cfg(feature="todo")]
+#[cfg(feature = "todo")]
 #[instrument(skip(conn), level = Level::DEBUG)]
 pub async fn changes(
     conn: &Connection,
