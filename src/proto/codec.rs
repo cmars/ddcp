@@ -22,7 +22,7 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Request {
     Status,
     Changes { since_db_version: i64 },
@@ -194,6 +194,7 @@ impl Decodable for Response {
 pub struct NodeStatus {
     pub site_id: Vec<u8>,
     pub db_version: i64,
+    pub key: String,
     pub route: Vec<u8>,
 }
 
@@ -204,6 +205,7 @@ impl Encodable for NodeStatus {
         let mut db_status_builder = node_status_builder.reborrow().init_db();
         db_status_builder.set_site_id(self.site_id.as_slice());
         db_status_builder.set_db_version(self.db_version);
+        node_status_builder.set_key(self.key.as_str().into());
         node_status_builder.set_route(self.route.as_slice());
         let message = serialize::write_message_segments_to_words(&builder);
         Ok(message)
@@ -218,6 +220,7 @@ impl Decodable for NodeStatus {
         Ok(NodeStatus {
             site_id: db_status.get_site_id()?.to_vec(),
             db_version: db_status.get_db_version(),
+            key: node_status_reader.get_key()?.to_string()?,
             route: node_status_reader.get_route()?.to_vec(),
         })
     }

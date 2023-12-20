@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use tracing::{debug, warn};
 use veilid_core::{
     CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, RouteId, RoutingContext, TableDB,
     TableStore, TypedKey, TypedKeyPair, ValueSubkey, VeilidAPI, CRYPTO_KIND_VLD0,
@@ -53,6 +54,13 @@ impl Sovereign {
 
     pub fn dht_key(&self) -> TypedKey {
         self.dht_key
+    }
+
+    pub fn auth_key(&self) -> TypedKey {
+        CryptoTyped {
+            kind: self.dht_owner_keypair.kind,
+            value: self.dht_owner_keypair.value.key,
+        }
     }
 
     pub async fn init(routing_context: &RoutingContext) -> Result<Sovereign> {
@@ -151,6 +159,11 @@ impl Sovereign {
                 NodeStatus {
                     site_id: status.site_id.clone(),
                     db_version: status.db_version,
+                    key: CryptoTyped {
+                        kind: self.dht_owner_keypair.kind,
+                        value: self.dht_owner_keypair.value.key,
+                    }
+                    .to_string(),
                     route: route.data.clone(),
                 }
                 .encode()?,
@@ -175,7 +188,7 @@ impl Sovereign {
 #[derive(Clone)]
 pub struct Peer {
     name: String,
-    dht_public_key: TypedKey,
+    dht_key: TypedKey,
 
     dht: Option<DHTRecordDescriptor>,
     node_status: Option<NodeStatus>,
@@ -230,7 +243,7 @@ impl Peer {
             .ok_or(other_err("remote peer missing dht key"))?;
         Ok(Peer {
             name: name.to_owned(),
-            dht_public_key,
+            dht_key: dht_public_key,
             dht: None,
             node_status: None,
             route_id: None,
@@ -246,7 +259,14 @@ impl Peer {
     }
 
     pub fn dht_key(&self) -> TypedKey {
-        self.dht_public_key
+        self.dht_key
+    }
+
+    pub fn auth_key(&self) -> Result<Option<TypedKey>> {
+        match self.node_status {
+            Some(ref ns) => Ok(Some(CryptoTyped::from_str(&ns.key)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn name(&self) -> String {
@@ -268,13 +288,9 @@ impl Peer {
                 .close_dht_record(dht.key().to_owned())
                 .await?;
         };
-        self.dht = Some(
-            routing_context
-                .open_dht_record(self.dht_public_key, None)
-                .await?,
-        );
+        self.dht = Some(routing_context.open_dht_record(self.dht_key, None).await?);
         self.node_status = match routing_context
-            .get_dht_value(self.dht_public_key, DHT_SUBKEY_STATUS, true)
+            .get_dht_value(self.dht_key, DHT_SUBKEY_STATUS, true)
             .await?
         {
             Some(data) => Some(NodeStatus::decode(data.data())?),
@@ -285,7 +301,13 @@ impl Peer {
 
     async fn refresh_route(&mut self, routing_context: &RoutingContext) -> Result<()> {
         if let Some(route_id) = self.route_id {
-            routing_context.api().release_private_route(route_id)?;
+            if let Err(e) = routing_context.api().release_private_route(route_id) {
+                warn!(
+                    err = format!("{:?}", e),
+                    route_id = route_id.to_string(),
+                    "failed to release private route"
+                );
+            }
         }
 
         if let Some(status) = &self.node_status {
@@ -406,7 +428,8 @@ impl Conclave {
                 req_bytes,
             )
             .await?;
-        match crypto.decode::<Response>(&resp_bytes)? {
+        let resp = Envelope::decode(resp_bytes.as_slice())?;
+        match crypto.decode::<Response>(&resp.contents)? {
             Response::Status(status) => Ok(status),
             r => Err(other_err(format!("invalid response: {:?}", r))),
         }
@@ -419,6 +442,7 @@ impl Conclave {
             contents: crypto.encode(Request::Changes { since_db_version })?,
         }
         .encode()?;
+        debug!(len = req_bytes.len(), "app_call request");
         let resp_bytes = self
             .routing_context
             .app_call(
@@ -426,7 +450,9 @@ impl Conclave {
                 req_bytes,
             )
             .await?;
-        match crypto.decode::<Response>(&resp_bytes)? {
+        debug!(len = resp_bytes.len(), "app_call response");
+        let resp = Envelope::decode(resp_bytes.as_slice())?;
+        match crypto.decode::<Response>(&resp.contents)? {
             Response::Changes(changes) => Ok(changes),
             r => Err(other_err(format!("invalid response: {:?}", r))),
         }
@@ -440,7 +466,7 @@ impl Conclave {
                 .get(CRYPTO_KIND_VLD0)
                 .ok_or(other_err("VLD0 not available"))?,
             self.sovereign.dht_owner_keypair,
-            peer.dht_public_key,
+            peer.auth_key()?.ok_or(other_err("peer key not found"))?,
         ))
     }
 
@@ -472,17 +498,94 @@ mod tests {
             .with_sequencing(Sequencing::PreferOrdered)
             .with_default_safety()
             .expect("ok");
+
+        // Add a peer and look it up
         let mut ccl = Conclave::new(routing_context).await.expect("ok");
         assert_eq!(ccl.peers().len(), 0);
-        let peer = Peer::new(
-            &api,
-            "bob",
-            "VLD0:7lxDEabK_qgjbe38RtBa3IZLrud84P6NhGP-pRTZzdQ",
-        )
-        .await
-        .expect("new peer");
+
+        let vld0 = ccl
+            .routing_context
+            .api()
+            .crypto()
+            .expect("crypto")
+            .get(CRYPTO_KIND_VLD0)
+            .expect("VLD0");
+        let peer_keypair = vld0.generate_keypair();
+
+        let peer = Peer::new(&api, "bob", &peer_keypair.key.to_string())
+            .await
+            .expect("new peer");
         ccl.set_peer(peer).await.expect("set peer");
         assert_eq!(ccl.peers().len(), 1);
+
+        ccl.close().await.expect("ok");
+        teardown_api(api).await;
+    }
+
+    #[tokio::test]
+    async fn pair() {
+        let _lock = TEST_API_MUTEX.lock().expect("lock");
+
+        let api = setup_api().await;
+        let routing_context = api
+            .routing_context()
+            .expect("routing context")
+            .with_sequencing(Sequencing::PreferOrdered)
+            .with_default_safety()
+            .expect("ok");
+
+        let mut ccl = Conclave::new(routing_context).await.expect("ok");
+        let vld0 = ccl
+            .routing_context
+            .api()
+            .crypto()
+            .expect("crypto")
+            .get(CRYPTO_KIND_VLD0)
+            .expect("VLD0");
+        let peer_keypair = CryptoTyped {
+            kind: CRYPTO_KIND_VLD0,
+            value: vld0.generate_keypair(),
+        };
+        let peer_auth_key = CryptoTyped {
+                kind: CRYPTO_KIND_VLD0,
+                value: peer_keypair.value.key,
+            };
+
+        // Add a peer and look it up
+        let mut peer = Peer::new(&api, "bob", &peer_auth_key.to_string())
+            .await
+            .expect("new peer");
+        peer.node_status = Some(NodeStatus {
+            site_id: vec![],
+            db_version: 42,
+            key: peer_auth_key.to_string(),
+            route: vec![],
+        });
+        ccl.set_peer(peer.clone()).await.expect("set peer");
+
+        let send_crypto = ccl.crypto(&peer).expect("peer crypto");
+        let recv_crypto = Crypto::new(vld0, peer_keypair, ccl.sovereign().auth_key());
+
+        // Test peer crypto
+        let req = Request::Changes {
+            since_db_version: 8,
+        };
+        let enc_req = send_crypto.encode(req.clone()).expect("encode");
+        let dec_req = recv_crypto
+            .decode::<Request>(enc_req.as_slice())
+            .expect("decode");
+        assert_eq!(req, dec_req);
+
+        // Through envelope
+        let req_send = Envelope{
+            sender: ccl.sovereign().dht_key().to_string(),
+            contents: send_crypto.encode(req.clone()).expect("encode"),
+        };
+        let msg = req_send.encode().expect("encode");
+        let req_recv = Envelope::decode(msg.as_slice()).expect("decode");
+        let req_decrypt = recv_crypto.decode::<Request>(req_recv.contents.as_slice()).expect("decode");
+        assert_eq!(req, req_decrypt);
+
         ccl.close().await.expect("ok");
         teardown_api(api).await;
     }

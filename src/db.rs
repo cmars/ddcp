@@ -3,8 +3,8 @@ use rusqlite::{params, OptionalExtension};
 use tokio_rusqlite::Connection;
 use tracing::{debug, instrument, trace, Level};
 
-use crate::error::Result;
 use crate::proto::codec::Change;
+use crate::error::Result;
 
 pub const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
 pub const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;
@@ -108,7 +108,7 @@ on conflict do update set version = max(version, excluded.version)",
         Ok(result)
     }
 
-    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
+    #[instrument(skip(self), level = Level::DEBUG, err)]
     pub async fn close(self) -> Result<()> {
         // Finalize cr-sqlite db
         self.conn

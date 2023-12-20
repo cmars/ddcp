@@ -17,7 +17,7 @@ use db::DB;
 pub use error::{other_err, Error, Result};
 use ident::{Conclave, Peer, Status};
 use proto::codec::{
-    ChangesResponse, Decodable, Envelope, NodeStatus, Request, Response, StatusResponse,
+    ChangesResponse, Decodable, Encodable, Envelope, NodeStatus, Request, Response, StatusResponse,
 };
 
 #[derive(Clone)]
@@ -100,8 +100,14 @@ impl DDCP {
         }
 
         // Set DHT state
-        self.push().await?;
-        Ok(())
+        loop {
+            match self.push().await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!(err = format!("{:?}", e), "failed to push status");
+                }
+            }
+        }
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
@@ -292,6 +298,7 @@ impl DDCP {
         peer_by_sender: &HashMap<String, Peer>,
         update: VeilidUpdate,
     ) -> Result<()> {
+        let sender = self.conclave.sovereign().dht_key().to_string();
         match update {
             VeilidUpdate::AppCall(app_call) => {
                 let envelope = Envelope::decode(app_call.message())?;
@@ -307,7 +314,8 @@ impl DDCP {
                 let responder = self.clone();
                 tokio::spawn(async move {
                     let crypto = responder.conclave.crypto(&peer)?;
-                    let request = crypto.decode::<Request>(app_call.message())?;
+                    let request = crypto.decode::<Request>(envelope.contents.as_slice())?;
+                    debug!(request = format!("{:?}", request), "handling app_call");
                     let resp = match request {
                         Request::Status => {
                             let (site_id, db_version) = responder.db.status().await?;
@@ -325,7 +333,14 @@ impl DDCP {
                     responder
                         .routing_context
                         .api()
-                        .app_call_reply(app_call.id(), resp)
+                        .app_call_reply(
+                            app_call.id(),
+                            Envelope {
+                                sender: sender.to_owned(),
+                                contents: resp,
+                            }
+                            .encode()?,
+                        )
                         .await?;
                     Ok::<(), Error>(())
                 }); // TODO: instrument

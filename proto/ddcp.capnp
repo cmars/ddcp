@@ -35,7 +35,8 @@ struct DBStatus {
 
 struct NodeStatus {
     db @0 :DBStatus;
-    route @1 :Data;
+    key @1 :Text;
+    route @2 :Data;
 }
 
 struct Change {
