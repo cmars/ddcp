@@ -199,20 +199,22 @@ impl DDCP {
 
         let puller = self.spawn_puller(token.clone());
         let server = self.spawn_server(token.clone());
-        tokio::spawn(async move {
+        let interrupter = tokio::spawn(async move {
             signal::ctrl_c().await?;
             warn!("interrupt received");
             token.cancel();
             Ok::<(), Error>(())
         });
 
-        tokio::join!(puller, server);
+        tokio::join!(puller, server, interrupter);
         Ok(())
     }
 
     async fn spawn_puller(&self, token: CancellationToken) -> JoinHandle<Result<()>> {
         let mut puller = self.clone();
         tokio::spawn(async move {
+            debug!("puller task starting");
+
             let mut timer = tokio::time::interval(REMOTE_TRACKER_PERIOD);
             loop {
                 select! {
@@ -250,6 +252,8 @@ impl DDCP {
     async fn spawn_server(&self, token: CancellationToken) -> JoinHandle<Result<()>> {
         let mut server = self.clone();
         tokio::spawn(async move {
+            debug!("server task starting");
+
             let mut timer = tokio::time::interval(LOCAL_TRACKER_PERIOD);
             let peer_by_key = HashMap::from_iter(
                 server
