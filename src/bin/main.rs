@@ -5,9 +5,7 @@ use tracing_subscriber::prelude::*;
 
 use ddcp::{
     cli::{Cli, Commands, RemoteArgs, RemoteCommands},
-    other_err,
-    Error,
-    Result, DDCP, //DDCP,
+    other_err, Error, Result, DDCP,
 };
 
 #[tokio::main]
@@ -50,6 +48,14 @@ async fn run() -> Result<()> {
     )
     .await?;
 
+    let app_result = run_app(cli, &mut app).await;
+    if let Err(e) = app.cleanup().await {
+        error!(err = format!("{:?}", e), "cleanup failed");
+    }
+    app_result
+}
+
+async fn run_app(cli: Cli, app: &mut DDCP) -> Result<()> {
     if cli.needs_network() {
         app.wait_for_network().await?;
     }
@@ -57,12 +63,12 @@ async fn run() -> Result<()> {
     let result = match cli.commands {
         Commands::Init => {
             let (addr, _site_id, version) = app.push().await?;
-            info!(key = addr, db_version = version, "Registered database at DHT");
+            info!(addr, db_version = version, "Registered database at DHT");
             Ok(())
         }
         Commands::Push => {
             let (addr, _site_id, version) = app.push().await?;
-            info!(key = addr, db_version = version, "Pushed database status to DHT");
+            info!(addr, db_version = version, "Pushed database status to DHT");
             Ok(())
         }
         Commands::Remote(RemoteArgs {
@@ -110,7 +116,5 @@ async fn run() -> Result<()> {
         },
         _ => Err(Error::Other("unsupported command".to_string())),
     };
-
-    app.cleanup().await?;
     result
 }

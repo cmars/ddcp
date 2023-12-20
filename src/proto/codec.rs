@@ -8,7 +8,7 @@ use rusqlite::types::Value;
 
 use super::{
     ddcp_capnp::request,
-    ddcp_capnp::{change_value, node_status, response, envelope},
+    ddcp_capnp::{change_value, envelope, node_status, response},
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -245,7 +245,10 @@ impl Decodable for Envelope {
         let reader = serialize::read_message(message, ReaderOptions::new())?;
         let envelope_reader = reader.get_root::<envelope::Reader>()?;
         Ok(Envelope {
-            sender: envelope_reader.get_sender()?.to_string().map_err(|e| Utf8Error::from(e))?,
+            sender: envelope_reader
+                .get_sender()?
+                .to_string()
+                .map_err(|e| Utf8Error::from(e))?,
             contents: envelope_reader.get_contents()?.to_vec(),
         })
     }

@@ -71,7 +71,7 @@ impl DDCP {
         Ok((routing_context, updates))
     }
 
-    #[instrument(skip(self), level = Level::INFO, ret, err)]
+    #[instrument(skip(self), level = Level::INFO, err)]
     pub async fn wait_for_network(&mut self) -> Result<()> {
         // Wait for network to be up
         loop {
@@ -128,8 +128,7 @@ impl DDCP {
                 .conclave
                 .peer_mut(name)
                 .ok_or(other_err("unknown peer"))?;
-            peer.refresh(&self.routing_context)
-                .await?;
+            peer.refresh(&self.routing_context).await?;
         }
 
         let peer = self.conclave.peer(name).ok_or(other_err("unknown peer"))?;
@@ -160,7 +159,7 @@ impl DDCP {
         Ok((true, merge_version))
     }
 
-    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
+    #[instrument(skip(self), level = Level::DEBUG, err)]
     pub async fn cleanup(self) -> Result<()> {
         // Release DHT resources
         self.conclave.close().await?;
@@ -174,7 +173,7 @@ impl DDCP {
         Ok(())
     }
 
-    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
+    #[instrument(skip(self), level = Level::DEBUG, err)]
     pub async fn remote_add(&mut self, name: String, addr: String) -> Result<()> {
         let peer = Peer::new(&self.routing_context.api(), name.as_str(), addr.as_str()).await?;
         self.conclave.set_peer(peer).await?;
@@ -193,8 +192,8 @@ impl DDCP {
             .collect()
     }
 
-    #[instrument(skip(self), level = Level::DEBUG, ret, err)]
-    pub async fn serve(self) -> Result<()> {
+    #[instrument(skip(self), level = Level::DEBUG, err)]
+    pub async fn serve(&self) -> Result<()> {
         let token = CancellationToken::new();
 
         let puller = self.spawn_puller(token.clone());
@@ -206,7 +205,8 @@ impl DDCP {
             Ok::<(), Error>(())
         });
 
-        tokio::join!(puller, server, interrupter);
+        let _ = tokio::join!(puller, server, interrupter);
+
         Ok(())
     }
 
@@ -280,7 +280,7 @@ impl DDCP {
                         }
                     }
                     _ = token.cancelled() => {
-                        return server.cleanup().await;
+                        return Ok(());
                     }
                 }
             }

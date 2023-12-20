@@ -7,7 +7,7 @@ use veilid_core::{
 use veilid_core::{FromStr, Target};
 
 use crate::proto::codec::{
-    ChangesResponse, Decodable, Encodable, NodeStatus, Request, Response, StatusResponse, Envelope,
+    ChangesResponse, Decodable, Encodable, Envelope, NodeStatus, Request, Response, StatusResponse,
 };
 use crate::proto::crypto::Crypto;
 use crate::{error::Result, other_err};
@@ -240,7 +240,8 @@ impl Peer {
     pub async fn remove(self, ts: &TableStore) -> Result<()> {
         let db = Self::open_db(ts).await?;
         let db_key = self.name.as_bytes();
-        db.delete(TABLE_STORE_REMOTES_COLUMN_DHT_KEY, db_key).await?;
+        db.delete(TABLE_STORE_REMOTES_COLUMN_DHT_KEY, db_key)
+            .await?;
         Ok(())
     }
 
@@ -379,7 +380,8 @@ impl Conclave {
     pub async fn remove_peer(&mut self, name: &str) -> Result<bool> {
         match self.remotes.remove(name) {
             Some(peer) => {
-                peer.remove(&self.routing_context.api().table_store()?).await?;
+                peer.remove(&self.routing_context.api().table_store()?)
+                    .await?;
                 Ok(true)
             }
             None => Ok(false),
@@ -392,10 +394,11 @@ impl Conclave {
 
     pub async fn status(&self, peer: &Peer) -> Result<StatusResponse> {
         let crypto = self.crypto(peer)?;
-        let req_bytes = Envelope{
+        let req_bytes = Envelope {
             sender: self.sovereign.dht_key.to_string(),
             contents: crypto.encode(Request::Status)?,
-        }.encode()?;
+        }
+        .encode()?;
         let resp_bytes = self
             .routing_context
             .app_call(
@@ -411,10 +414,11 @@ impl Conclave {
 
     pub async fn changes(&self, peer: &Peer, since_db_version: i64) -> Result<ChangesResponse> {
         let crypto = self.crypto(peer)?;
-        let req_bytes = Envelope{
+        let req_bytes = Envelope {
             sender: self.sovereign.dht_key.to_string(),
             contents: crypto.encode(Request::Changes { since_db_version })?,
-        }.encode()?;
+        }
+        .encode()?;
         let resp_bytes = self
             .routing_context
             .app_call(
