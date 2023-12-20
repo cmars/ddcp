@@ -3,8 +3,8 @@ use rusqlite::{params, OptionalExtension};
 use tokio_rusqlite::Connection;
 use tracing::{debug, instrument, trace, Level};
 
-use crate::proto::codec::Change;
 use crate::error::Result;
+use crate::proto::codec::Change;
 
 pub const CRSQL_TRACKED_TAG_WHOLE_DATABASE: i32 = 0;
 pub const CRSQL_TRACKED_EVENT_RECEIVE: i32 = 0;

@@ -5,7 +5,7 @@ use tracing_subscriber::prelude::*;
 
 use ddcp::{
     cli::{Cli, Commands, RemoteArgs, RemoteCommands},
-    other_err, Error, Result, DDCP,
+    other_err, warn_err, Error, Result, DDCP,
 };
 
 #[tokio::main]
@@ -49,9 +49,7 @@ async fn run() -> Result<()> {
     .await?;
 
     let app_result = run_app(cli, &mut app).await;
-    if let Err(e) = app.cleanup().await {
-        error!(err = format!("{:?}", e), "cleanup failed");
-    }
+    let _ = warn_err(app.cleanup().await, "cleanup failed");
     app_result
 }
 
@@ -103,8 +101,11 @@ async fn run_app(cli: Cli, app: &mut DDCP) -> Result<()> {
                 let remotes = app.remotes();
                 let mut errors = vec![];
                 for (name, _) in remotes.iter() {
-                    if let Err(e) = app.pull(name).await {
-                        errors.push(format!("failed to fetch {}: {:?}", name, e));
+                    if let Err(e) = warn_err(
+                        app.pull(name).await,
+                        format!("failed to pull from {}", name).as_str(),
+                    ) {
+                        errors.push(format!("{:?}", e));
                     }
                 }
                 if errors.is_empty() {

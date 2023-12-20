@@ -14,7 +14,7 @@ mod proto;
 pub mod veilid_config;
 
 use db::DB;
-pub use error::{other_err, Error, Result};
+pub use error::{other_err, warn_err, Error, Result};
 use ident::{Conclave, Peer, Status};
 use proto::codec::{
     ChangesResponse, Decodable, Encodable, Envelope, NodeStatus, Request, Response, StatusResponse,
@@ -168,7 +168,10 @@ impl DDCP {
     #[instrument(skip(self), level = Level::DEBUG, err)]
     pub async fn cleanup(self) -> Result<()> {
         // Release DHT resources
-        self.conclave.close().await?;
+        let _ = warn_err(
+            self.conclave.close().await,
+            "failed to release conclave resources",
+        );
 
         // Shut down Veilid node
         self.routing_context.api().shutdown().await;
@@ -226,23 +229,20 @@ impl DDCP {
                 select! {
                     _ = timer.tick() => {
                         info!("refreshing peers");
-                        if let Err(e) = puller.conclave.refresh_peers().await {
-                            error!(err = format!("{:?}", e), "refresh failed");
+                        if let Err(_) = warn_err(puller.conclave.refresh_peers().await, "refresh failed") {
                             continue
                         }
 
                         for peer in puller.conclave.peers() {
                             info!(name = peer.name(), "pulling from peer");
                             let peer_status = match peer.node_status() {
-                                    Some(status) => status,
-                                    None => {
-                                        error!("peer missing status");
-                                        continue
-                                    }
-                                };
-                            if let Err(e) = puller.pull_from(peer, &peer_status).await {
-                                error!(err = format!("{:?}", e), name = peer.name(), "pull failed");
-                            } else {
+                                Some(status) => status,
+                                None => {
+                                    error!("peer missing status");
+                                    continue
+                                }
+                            };
+                            if let Ok(_) = warn_err(puller.pull_from(peer, &peer_status).await, "pull failed") {
                                 info!(name = peer.name(), "pull ok");
                             }
                         }
@@ -271,16 +271,12 @@ impl DDCP {
                 select! {
                     _ = timer.tick() => {
                         // TODO: spawn this? how long does it block the loop?
-                        if let Err(e) = server.push().await {
-                            error!(err = format!("{:?}", e), "failed to push status");
-                        }
+                        let _ = warn_err(server.push().await, "push failed");
                     }
                     res = server.updates.recv_async() => {
                         match res {
                             Ok(update) => {
-                                if let Err(e) = server.handle_update(&peer_by_key, update).await {
-                                    error!(err = format!("{:?}", e), "failed to handle update");
-                                }
+                                let _ = warn_err(server.handle_update(&peer_by_key, update).await, "failed to handle update");
                             }
                             Err(e) => return Err(other_err(e)),
                         }

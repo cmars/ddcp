@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
-use tracing::{debug, warn};
+use tracing::debug;
 use veilid_core::{
     CryptoTyped, DHTRecordDescriptor, DHTSchemaDFLT, KeyPair, RouteId, RoutingContext, TableDB,
     TableStore, TypedKey, TypedKeyPair, ValueSubkey, VeilidAPI, CRYPTO_KIND_VLD0,
 };
 use veilid_core::{FromStr, Target};
 
+use crate::error::warn_err;
 use crate::proto::codec::{
-    ChangesResponse, Decodable, Encodable, Envelope, NodeStatus, Request, Response, StatusResponse,
+    ChangesResponse, Decodable, Encodable, Envelope, NodeStatus, Request, Response,
 };
 use crate::proto::crypto::Crypto;
 use crate::{error::Result, other_err};
@@ -159,11 +160,7 @@ impl Sovereign {
                 NodeStatus {
                     site_id: status.site_id.clone(),
                     db_version: status.db_version,
-                    key: CryptoTyped {
-                        kind: self.dht_owner_keypair.kind,
-                        value: self.dht_owner_keypair.value.key,
-                    }
-                    .to_string(),
+                    key: self.auth_key().to_string(),
                     route: route.data.clone(),
                 }
                 .encode()?,
@@ -301,13 +298,11 @@ impl Peer {
 
     async fn refresh_route(&mut self, routing_context: &RoutingContext) -> Result<()> {
         if let Some(route_id) = self.route_id {
-            if let Err(e) = routing_context.api().release_private_route(route_id) {
-                warn!(
-                    err = format!("{:?}", e),
-                    route_id = route_id.to_string(),
-                    "failed to release private route"
-                );
-            }
+            let _ = warn_err(
+                routing_context.api().release_private_route(route_id),
+                "failed to release private route",
+            );
+            self.route_id = None;
         }
 
         if let Some(status) = &self.node_status {
@@ -412,27 +407,6 @@ impl Conclave {
 
     pub fn peers<'a>(&'a self) -> std::collections::hash_map::Values<'a, String, Peer> {
         self.remotes.values().into_iter()
-    }
-
-    pub async fn status(&self, peer: &Peer) -> Result<StatusResponse> {
-        let crypto = self.crypto(peer)?;
-        let req_bytes = Envelope {
-            sender: self.sovereign.dht_key.to_string(),
-            contents: crypto.encode(Request::Status)?,
-        }
-        .encode()?;
-        let resp_bytes = self
-            .routing_context
-            .app_call(
-                Target::PrivateRoute(peer.route_id.ok_or(other_err("no route to peer"))?),
-                req_bytes,
-            )
-            .await?;
-        let resp = Envelope::decode(resp_bytes.as_slice())?;
-        match crypto.decode::<Response>(&resp.contents)? {
-            Response::Status(status) => Ok(status),
-            r => Err(other_err(format!("invalid response: {:?}", r))),
-        }
     }
 
     pub async fn changes(&self, peer: &Peer, since_db_version: i64) -> Result<ChangesResponse> {
@@ -547,9 +521,9 @@ mod tests {
             value: vld0.generate_keypair(),
         };
         let peer_auth_key = CryptoTyped {
-                kind: CRYPTO_KIND_VLD0,
-                value: peer_keypair.value.key,
-            };
+            kind: CRYPTO_KIND_VLD0,
+            value: peer_keypair.value.key,
+        };
 
         // Add a peer and look it up
         let mut peer = Peer::new(&api, "bob", &peer_auth_key.to_string())
@@ -577,13 +551,15 @@ mod tests {
         assert_eq!(req, dec_req);
 
         // Through envelope
-        let req_send = Envelope{
+        let req_send = Envelope {
             sender: ccl.sovereign().dht_key().to_string(),
             contents: send_crypto.encode(req.clone()).expect("encode"),
         };
         let msg = req_send.encode().expect("encode");
         let req_recv = Envelope::decode(msg.as_slice()).expect("decode");
-        let req_decrypt = recv_crypto.decode::<Request>(req_recv.contents.as_slice()).expect("decode");
+        let req_decrypt = recv_crypto
+            .decode::<Request>(req_recv.contents.as_slice())
+            .expect("decode");
         assert_eq!(req, req_decrypt);
 
         ccl.close().await.expect("ok");
