@@ -5,9 +5,9 @@ values (
    '227546dfbb7414953e49c1378d9975c4',
    null,
    crsql_site_id(),
-   "First Post",
+   'First Post',
    null,
-   "First post!"
+   'First post!'
 );
 
 insert into profiles (
@@ -15,7 +15,7 @@ insert into profiles (
 )
 values (
     crsql_site_id(),
-    "The O.G. metasyntactial protocol practitioner"
+    'The O.G. metasyntactial protocol practitioner'
 );
 
 select crsql_finalize();
