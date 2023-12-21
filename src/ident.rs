@@ -297,14 +297,6 @@ impl Peer {
     }
 
     async fn refresh_route(&mut self, routing_context: &RoutingContext) -> Result<()> {
-        if let Some(route_id) = self.route_id {
-            let _ = warn_err(
-                routing_context.api().release_private_route(route_id),
-                "failed to release private route",
-            );
-            self.route_id = None;
-        }
-
         if let Some(status) = &self.node_status {
             self.route_id = Some(
                 routing_context
@@ -417,13 +409,23 @@ impl Conclave {
         }
         .encode()?;
         debug!(len = req_bytes.len(), "app_call request");
-        let resp_bytes = self
+        let peer_route_id = peer.route_id.ok_or(other_err("no route to peer"))?;
+        let resp_bytes = match self
             .routing_context
-            .app_call(
-                Target::PrivateRoute(peer.route_id.ok_or(other_err("no route to peer"))?),
-                req_bytes,
-            )
-            .await?;
+            .app_call(Target::PrivateRoute(peer_route_id), req_bytes)
+            .await
+        {
+            Ok(resp_bytes) => resp_bytes,
+            Err(e) => {
+                let _ = warn_err(
+                    self.routing_context
+                        .api()
+                        .release_private_route(peer_route_id),
+                    "failed to release peer route",
+                );
+                return Err(crate::Error::VeilidAPI(e));
+            }
+        };
         debug!(len = resp_bytes.len(), "app_call response");
         let resp = Envelope::decode(resp_bytes.as_slice())?;
         match crypto.decode::<Response>(&resp.contents)? {

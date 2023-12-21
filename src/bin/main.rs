@@ -11,7 +11,7 @@ use ddcp::{
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(
             EnvFilter::builder()
                 .with_default_directive("ddcp=info".parse().unwrap())
@@ -19,9 +19,8 @@ async fn main() {
         )
         .init();
 
-    match run().await {
-        Ok(()) => {}
-        Err(e) => error!("{:?}", e),
+    if let Err(_) = run().await {
+        std::process::exit(1);
     }
 }
 
@@ -71,22 +70,29 @@ async fn run_app(cli: Cli, app: &mut DDCP) -> Result<()> {
         }
         Commands::Remote(RemoteArgs {
             commands: RemoteCommands::Add { name, addr },
-        }) => app.remote_add(name, addr).await,
-        Commands::Remote(RemoteArgs {
-            commands: RemoteCommands::Remove { name },
         }) => {
-            match app.remote_remove(name.clone()).await? {
-                true => info!(peer = name, "removed peer"),
-                false => info!(peer = name, "peer not found"),
-            };
+            app.remote_add(name.clone(), addr.clone()).await?;
+            info!(name, addr, "remote added");
             Ok(())
         }
+        Commands::Remote(RemoteArgs {
+            commands: RemoteCommands::Remove { name },
+        }) => match app.remote_remove(name.clone()).await? {
+            true => {
+                info!(name, "remote removed");
+                Ok(())
+            }
+            false => {
+                error!(name, "not found");
+                Err(other_err("failed to remove remote"))
+            }
+        },
         Commands::Remote(RemoteArgs {
             commands: RemoteCommands::List,
         }) => {
             let remotes = app.remotes();
             for remote in remotes.iter() {
-                info!("{}\t{}", remote.0, remote.1);
+                println!("{}\t{}", remote.0, remote.1);
             }
             Ok(())
         }
@@ -115,6 +121,10 @@ async fn run_app(cli: Cli, app: &mut DDCP) -> Result<()> {
                 }
             }
         },
+        Commands::Addr => {
+            println!("{}", app.addr());
+            Ok(())
+        }
         _ => Err(Error::Other("unsupported command".to_string())),
     };
     result

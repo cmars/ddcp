@@ -51,6 +51,7 @@ pub enum Commands {
     Remote(RemoteArgs),
     Serve,
     Shell,
+    Addr,
     Cleanup,
 }
 
@@ -87,7 +88,6 @@ impl Cli {
         match self.commands {
             Commands::Remote(_) => false,
             Commands::Shell => false,
-            Commands::Merge { name: _ } => false,
             _ => true,
         }
     }

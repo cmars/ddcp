@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use flume::{unbounded, Receiver, Sender};
 use tokio::{select, signal, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, instrument, warn, Level};
+use tracing::{debug, error, info, instrument, trace, warn, Level};
 use veilid_core::{CryptoKey, CryptoTyped, RoutingContext, Sequencing, VeilidUpdate};
 
 pub mod cli;
@@ -92,7 +92,9 @@ impl DDCP {
                         "Waiting for network"
                     );
                 }
-                Ok(_) => {}
+                Ok(u) => {
+                    trace!(update = format!("{:?}", u));
+                }
                 Err(e) => {
                     return Err(Error::Other(e.to_string()));
                 }
@@ -108,6 +110,11 @@ impl DDCP {
                 }
             }
         }
+    }
+
+    pub fn addr(&self) -> String {
+        let dht_key = self.conclave.sovereign().dht_key();
+        return dht_key.to_string();
     }
 
     #[instrument(skip(self), level = Level::DEBUG, ret, err)]
@@ -203,6 +210,8 @@ impl DDCP {
 
     #[instrument(skip(self), level = Level::DEBUG, err)]
     pub async fn serve(&self) -> Result<()> {
+        info!(addr = self.addr(), "starting server");
+
         let token = CancellationToken::new();
 
         let puller = self.spawn_puller(token.clone());
@@ -213,6 +222,7 @@ impl DDCP {
             token.cancel();
             Ok::<(), Error>(())
         });
+        info!(addr = self.addr(), "server started");
 
         let _ = tokio::join!(puller, server, interrupter);
 
