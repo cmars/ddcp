@@ -12,6 +12,7 @@ RUN apt-get update -qq && \
         lsb-release \
         patchutils \
         unzip \
+        libclang-dev \
         --no-install-recommends
 
 # Install rustup, use nightly. crsqlite needs nightly.
