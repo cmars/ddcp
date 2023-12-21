@@ -18,6 +18,11 @@ jobs:
     - uses: actions/checkout@v3
       with:
         submodules: 'true'
+    - name: Install serde tooling
+      run: |-
+        cd src/external/veilid
+        bash -xe scripts/earthly/install_capnproto.sh
+        bash -xe scripts/earthly/install_protoc.sh
     - name: Build
       run: cargo build --verbose
     - name: Run tests
