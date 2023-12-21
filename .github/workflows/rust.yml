@@ -20,7 +20,7 @@ jobs:
         submodules: 'true'
     - name: Install serde tooling
       run: |-
-        cd src/external/veilid
+        cd external/veilid
         bash -xe scripts/earthly/install_capnproto.sh
         bash -xe scripts/earthly/install_protoc.sh
     - name: Build
