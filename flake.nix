@@ -23,7 +23,7 @@
           ];
         };
 
-        arch = "x86_64";  # TODO: derive this from system?
+        arch = flake-utils.lib.system.system;
 
       in {
 
