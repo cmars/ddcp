@@ -1,5 +1,12 @@
 [package]
 name = "ddcp"
+description = "Distributed decentralized database-to-database copy"
+homepage = "https://gitlab.com/cmars232/ddcp"
+documentation = "https://docs.rs/ddcp"
+repository = "https://gitlab.com/cmars232/ddcp.git"
+readme = "README.md"
+keywords = ["distributed", "decentralized", "database", "sqlite", "veilid"]
+categories = ["command-line-utilities", "database"]
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
