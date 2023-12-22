@@ -247,18 +247,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-tls"
-version = "0.12.0"
-source = "git+https://github.com/async-rs/async-tls?rev=c58588a#c58588a276e6180f3ef99f4ec3bf9176c5f0f58c"
-dependencies = [
- "futures-core",
- "futures-io",
- "rustls",
- "rustls-pemfile",
- "webpki-roots 0.22.6",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.74"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -267,20 +255,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.41",
-]
-
-[[package]]
-name = "async-tungstenite"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1e9efbe14612da0a19fb983059a0b621e9cf6225d7018ecab4f9988215540dc"
-dependencies = [
- "async-tls",
- "futures-io",
- "futures-util",
- "log",
- "pin-project-lite",
- "tungstenite",
 ]
 
 [[package]]
@@ -3532,6 +3506,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
+name = "veilid-async-tls"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f273e0e7f394ba1d52a1613411cb7442641f2625eb25cfd13d31965d8da558ee"
+dependencies = [
+ "futures-core",
+ "futures-io",
+ "rustls",
+ "rustls-pemfile",
+ "webpki-roots 0.22.6",
+]
+
+[[package]]
+name = "veilid-async-tungstenite"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ae5d6d02764ce82b7fdae4360bd497fe8df7a08a5901ef15a49e1ee2f734e2d"
+dependencies = [
+ "futures-io",
+ "futures-util",
+ "log",
+ "pin-project-lite",
+ "tungstenite",
+ "veilid-async-tls",
+]
+
+[[package]]
 name = "veilid-bugsalot"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3540,12 +3541,12 @@ checksum = "a9ee584edf237fac328b891dd06c21e7914a1db3762907edc366a13803451fe3"
 [[package]]
 name = "veilid-core"
 version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a6a1e20d5ffec373014131b06072b3ff89e8eae418ac44059094ae84219572a"
 dependencies = [
  "argon2",
  "async-io",
  "async-lock",
- "async-tls",
- "async-tungstenite",
  "async_executors",
  "backtrace",
  "blake3",
@@ -3612,6 +3613,8 @@ dependencies = [
  "tracing-wasm",
  "trust-dns-resolver",
  "tsify",
+ "veilid-async-tls",
+ "veilid-async-tungstenite",
  "veilid-bugsalot",
  "veilid-hashlink",
  "veilid-igd",
@@ -3656,6 +3659,8 @@ dependencies = [
 [[package]]
 name = "veilid-tools"
 version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e702e0916e9362c8cc3d888b0b9e374980111305e2ab37ebd74b277df5b1a0a5"
 dependencies = [
  "android_logger 0.13.3",
  "async-lock",
@@ -4289,3 +4294,8 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[patch.unused]]
+name = "async-tls"
+version = "0.12.0"
+source = "git+https://github.com/async-rs/async-tls?rev=c58588a#c58588a276e6180f3ef99f4ec3bf9176c5f0f58c"

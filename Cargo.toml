@@ -3,7 +3,6 @@ name = "ddcp"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
-exclude = ["./external"]
 license = "MPL-2.0"
 
 [lib]
@@ -29,11 +28,8 @@ tokio-rusqlite = "0.4"
 tokio-util = "0.7"
 tracing = { version = "0.1", features = ["log", "attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-veilid-core = { path = "external/veilid/veilid-core" }
+veilid-core = "0.2.5"
 xdg = "2.5"
-
-[patch.crates-io]
-async-tls = { git = "https://github.com/async-rs/async-tls", rev = "c58588a" }  # Matching veilid 0.2.5 tls patch
 
 [build-dependencies]
 capnpc = "0.18"

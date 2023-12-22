@@ -28,13 +28,12 @@
       in {
 
         devShells.default = pkgs.mkShell {
-          buildInputs = [
-          ] ++ (with pkgs; [
+          buildInputs = (with pkgs; [
             cargo
             cargo-watch
+            (rust-bin.nightly."2023-06-17".default.override { extensions = [ "rust-src" ]; })
             rustfmt
             rust-analyzer
-            (rust-bin.nightly.latest.default.override { extensions = [ "rust-src" ]; })
             clang
             llvmPackages.llvm
             llvmPackages.libclang
