@@ -19,13 +19,11 @@ RUN apt-get update -qq && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-WORKDIR /src
-COPY external/ external/
-
 # Install serde tooling, needed by veilid-core dependency during build
-WORKDIR /src/external/veilid
-RUN bash -xe scripts/earthly/install_capnproto.sh
-RUN bash -xe scripts/earthly/install_protoc.sh
+WORKDIR /src
+COPY scripts/ scripts/
+RUN bash -xe scripts/install_capnproto.sh
+RUN bash -xe scripts/install_protoc.sh
 
 # Cache ddcp crate dependencies
 WORKDIR /src

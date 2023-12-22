@@ -1,0 +1,8 @@
+The following scripts are redistributed from Veilid
+(https://gitlab.com/veilid/veilid):
+
+install_capnproto.sh
+install_protoc.sh
+
+Redistribution of these files is subject to the Veilid project's LICENSE
+agreement, which may be found at the above URL (MPL-2.0).
