@@ -19,8 +19,8 @@ if [ ! -f "external/cr-sqlite/core/rs/sqlite-rs-embedded/rust-toolchain.toml" ];
     (cd external/cr-sqlite; git submodule init && git submodule update --recursive)
 fi
 
-if [[ "$(pwd)" =~ "/target/package/ddcp-" ]]; then
-    # We're almost certain to be in a cargo publish.
+if [[ "$(pwd)" =~ "/target/package/ddcp-" || "$(pwd)" =~ "/.cargo/registry/src/index.crates.io-" ]]; then
+    # We're almost certain to be in a cargo publish or install.
     #
     # cargo publish doesn't seem to include the full vendored cr-sqlite project
     # in the package, so we'll copy cr-sqlite from vendored source to a temp
