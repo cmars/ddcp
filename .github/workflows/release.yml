@@ -35,6 +35,10 @@ jobs:
 
     - name: Install release tools
       run: cargo install cargo-release convco
+    - name: Set up git committer
+      run: |-
+        git config --global user.email "ddcp-releaser@users.noreply.github.com"
+        git config --global user.name "DDCP Release Github Action"
     - name: Release
       run: cargo release --execute --no-confirm $(convco version --bump)
     env:
