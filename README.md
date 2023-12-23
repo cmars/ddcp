@@ -117,17 +117,17 @@ cargo build
 
 ## Other platforms
 
-DDCP development assumes Rust stable. DDCP vendors and builds [CR-SQLite](https://github.com/vlcn-io/cr-sqlite#building) and [Veilid](https://gitlab.com/veilid/veilid) from source in order to simplify distribution.
-
-This might probably work:
+This might probably work, with compilers and development libraries installed:
 
 ```bash
-git clone --recurse-submodules https://gitlab.com/cmars232/ddcp 
-cd ddcp/external/veilid
-# Set up Veilid development environment per instructions there...
-cd ../..
-cargo build
+# Install serde tooling; used in cargo build (for now)
+./scripts/install_capnproto.sh
+./scripts/install_protoc.sh
+
+cargo build --release
 ```
+
+You can also try `cargo install ddcp` but the build will still require the serde tooling to be installed.
 
 # Roadmap
 
