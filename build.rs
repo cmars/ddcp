@@ -2,7 +2,7 @@ use std::process::Command;
 
 fn main() {
     // Compile cr-sqlite
-    let build_crsqlite_output = Command::new("sh")
+    let build_crsqlite_output = Command::new("bash")
         .args(["scripts/build_cr_sqlite.sh"])
         .output()
         .expect("failed to build cr-sqlite");
