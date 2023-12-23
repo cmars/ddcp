@@ -38,6 +38,7 @@
             llvmPackages.llvm
             llvmPackages.libclang
             gnumake
+            cmake
             sqlite
             capnproto
             protobuf
