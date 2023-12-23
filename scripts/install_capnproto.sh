@@ -8,7 +8,7 @@ curl -O https://capnproto.org/capnproto-c++-${CAPNPROTO_VERSION}.tar.gz
 tar zxf capnproto-c++-${CAPNPROTO_VERSION}.tar.gz
 cd capnproto-c++-${CAPNPROTO_VERSION}
 ./configure --without-openssl
-make -j$1 check
+make -j$1 all
 if [ "$EUID" -ne 0 ]; then
     if command -v checkinstall &> /dev/null; then 
         sudo checkinstall -y
