@@ -41,7 +41,7 @@ RUN cargo build --release
 
 ### Runtime
 
-FROM debian:bookworm-slim
+FROM debian:12.11-slim
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3
 COPY --from=builder /src/target/release/ddcp /usr/bin/ddcp
 COPY --from=builder /src/target/release/crsqlite.so /usr/lib/crsqlite.so
